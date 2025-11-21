@@ -1,0 +1,12 @@
+# Ignore everything except Python source files and this .gitignore
+*
+
+# Keep this file
+!.gitignore
+
+# Allow files
+!predictor.py
+!base_distribution.py
+!base_speed_distribution.json
+!README.md
+
