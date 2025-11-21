@@ -5,7 +5,7 @@ import json
 import os
 import time
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from scipy.optimize import curve_fit
 import logging
@@ -194,7 +194,7 @@ class SeasonalityHandler:
         # panic_ease_power 控制在 panic 窗口中 progress->eased 的速率，
         # 值越大越慢接近 target（例如 2.0 或 3.0 会比 0.8 慢得多）
         self.panic_ease_power = float(panic_ease_power)
-        print(f"昼夜节律数据已加载（使用本地小时），全局基准速度均值: {self.global_mean:.4f} panic_ease_power={self.panic_ease_power}")
+        print(f"昼夜节律数据已加载，全局基准速度均值: {self.global_mean:.4f} panic_ease_power={self.panic_ease_power}")
 
     def _load_json(self, path):
         if not os.path.exists(path):
@@ -295,10 +295,10 @@ class SeasonalityHandler:
             # configured tz_offset to obtain the activity-local datetime.
             # This avoids relying on system localtime (which may be UTC on servers)
             # and ensures consistent seasonality lookup across environments.
-            dt_utc = datetime.utcfromtimestamp(current_ts / 1000)
+            dt_utc = datetime.fromtimestamp(current_ts / 1000, timezone.utc)
             dt_local = dt_utc + timedelta(hours=self.tz_offset)
 
-            # 1) 原始节律因子（基于本地小时）
+            # 1) 原始节律因子
             raw_factor = self.get_factor(dt_local)
 
             # 2) 恐慌/肾上腺素修正（如果提供了 total_hours）
@@ -445,7 +445,7 @@ class DataHandler:
         返回整数小时偏移（例如 0、8、9）。
         """
         try:
-            dt_utc = datetime.utcfromtimestamp(start_ts / 1000)
+            dt_utc = datetime.fromtimestamp(start_ts / 1000, timezone.utc)
             utc_hour = dt_utc.hour
             print(f"活动开始时间 (UTC): {dt_utc} (Hour: {utc_hour})")
 
@@ -1161,6 +1161,15 @@ class DataHandler:
         
         plt.tight_layout()
 
+        # --- 添加水印 (适用于 fig/bytes/path 三种返回方式) ---
+        try:
+            wm_text = "@byydzh mycx 1000"
+            # 使用 Figure coordinates (0..1), 右下角放置，半透明以免遮挡
+            fig.text(0.99, 0.01, wm_text, fontsize=10, color='gray', alpha=0.6,
+                     ha='right', va='bottom', zorder=100)
+        except Exception as e:
+            logger.debug(f"Failed to draw watermark: {e}")
+
         # Return behavior for integration (Streamlit etc.)
         if return_type == 'fig':
             # Return the Figure object for caller to render; do not close here
@@ -1206,8 +1215,8 @@ class DataHandler:
 if __name__ == "__main__":
     try:
         # 假设预测 xxx，时间冻结在 xxh
-        handler = DataHandler(312, debug_hours=60)
-        # handler = DataHandler()
+        # handler = DataHandler(312, debug_hours=60)
+        handler = DataHandler()
         handler.load_target_data()
         handler.find_similar_events()
         
