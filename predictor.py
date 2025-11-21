@@ -162,15 +162,6 @@ class CosineModeler:
         pass
 
     def shape_function(self, t, Base, A, B, B_end, T_panic, T_total):
-        """
-        t: 时间数组
-        A_start: 开局倍率 (前24小时)
-        Base: 基础巡航速度
-        Slope: 线性增长系数 (使基础速度随时间线性增加)
-        B_end: 结尾冲刺倍率
-        T_panic: 冲刺持续时间 (小时)
-        T_total: 总时长 (固定值)
-        """
         # 1. 基础层 + 二次增长层 (Base + A * t + B * t^2)
         #    通过二次项可以更灵活地拟合中段的曲线行为（凹/凸），替代之前的线性项
         y = Base + (A * t) + (B * (t ** 2))
@@ -380,7 +371,7 @@ class DataHandler:
         
         # 1. 确定对比窗口 (Comparison Window)
         # 起点：6小时 (跳过开局暴冲)
-        # 终点：当前时间，但上限锁死在 72小时 (3天)，正如主人所令
+        # 终点：当前时间，但上限锁死在 72小时 (3天)
         t_start_cmp = 6.0
         t_end_cmp = min(self.debug_hours, 72.0)
         
