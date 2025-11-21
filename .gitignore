@@ -9,4 +9,5 @@
 !base_distribution.py
 !base_speed_distribution.json
 !README.md
-
+!examples
+!examples/*
