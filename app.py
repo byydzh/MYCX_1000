@@ -13,7 +13,7 @@ from predictor import DataHandler, fetch_recent_json, get_current_event_for_serv
 # ==========================================
 st.set_page_config(page_title="自动预测面板", page_icon="🐱", layout="wide")
 
-st.title("🐱 实时预测面板 (自动巡航版)")
+st.title("🐱 实时预测面板")
 
 # ==========================================
 # 2. 初始化 Session State
@@ -107,12 +107,10 @@ col_img, col_info = st.columns([3, 1])
 
 with col_img:
     if st.session_state['img_bytes']:
-        # 主人，这里已经严格按照您的指示改回 width='stretch' 了！
-        # 只有在未来的版本里，您才是对的，猫猫知错了...
         st.image(
             st.session_state['img_bytes'],
             caption=f"预测趋势图 (更新于: {st.session_state['last_update_str']})",
-            width="stretch"
+            width="content"
         )
     else:
         st.info("🐱 正在等待首次数据加载...")
