@@ -6,6 +6,7 @@ import os
 import time
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from io import BytesIO
 from scipy.optimize import curve_fit
 import logging
 from logging import handlers
@@ -31,6 +32,24 @@ LOG_PATH = os.path.join(os.path.dirname(__file__), 'predictor.log')
 logger = logging.getLogger('predictor')
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
+    # Auto-truncate/rotate log if it grows beyond 1MB to avoid disk bloat
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > (1 * 1024 * 1024):
+            # simple truncation: rename the old file with timestamp and start fresh
+            try:
+                bak = LOG_PATH + ".old"
+                if os.path.exists(bak):
+                    os.remove(bak)
+                os.rename(LOG_PATH, bak)
+            except Exception:
+                # fallback: truncate in place
+                try:
+                    open(LOG_PATH, 'w', encoding='utf-8').close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     fh = logging.FileHandler(LOG_PATH, mode='a', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -38,6 +57,129 @@ if not logger.handlers:
     logger.addHandler(fh)
     # Disable propagation to avoid duplicate console output from root logger
     logger.propagate = False
+
+
+def fetch_recent_json(timeout=10):
+    """Fetch Bestdori recent.json and return parsed JSON or None on failure."""
+    url = "https://bestdori.com/api/news/dynamic/recent.json"
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch recent.json from Bestdori: {e}")
+        return None
+
+
+def get_current_event_for_server(recent_json=None, server_index=3, now_ts_ms=None, fetch_if_missing=True):
+    """
+    Determine the current event ID for a server given a Bestdori `recent.json` structure.
+
+    Parameters:
+    - recent_json: dict or None. If None and fetch_if_missing==True, the function will fetch the JSON.
+    - server_index: int index into arrays like startAt/endAt for the target server.
+      NOTE: user environment reported CN at position index 3 (4th position). Default here is 3 to match that.
+    - now_ts_ms: optional epoch milliseconds to use as "now" (for testing). Defaults to current time.
+
+    Returns:
+    - event_id (int) of the active event for that server, or the nearest event id (int) when no active event,
+      or None if parsing/fetch fails.
+    """
+    if recent_json is None:
+        if not fetch_if_missing:
+            return None
+        recent_json = fetch_recent_json()
+
+    if not recent_json:
+        return None
+
+    # The `events` node normally contains mapping event_id -> metadata dict
+    events_node = None
+    if isinstance(recent_json, dict):
+        # try common keys first
+        if 'events' in recent_json and isinstance(recent_json['events'], dict):
+            events_node = recent_json['events']
+        else:
+            # If recent_json is already the events dict, accept it
+            # (bestdori may return nested structures in some proxies)
+            # detect by checking items have 'startAt' keys
+            ok = True
+            for k, v in recent_json.items():
+                if not isinstance(v, dict) or ('startAt' not in v and 'start_at' not in v):
+                    ok = False
+                    break
+            if ok:
+                events_node = recent_json
+
+    if not events_node:
+        logger.warning('Cannot locate events node in recent.json')
+        return None
+
+    now_ms = int(now_ts_ms) if now_ts_ms is not None else int(time.time() * 1000)
+
+    active_candidates = []
+    nearest_candidate = None
+    nearest_dist = None
+
+    for eid, meta in events_node.items():
+        try:
+            # support both camelCase and snake_case keys
+            starts = meta.get('startAt') or meta.get('start_at')
+            ends = meta.get('endAt') or meta.get('end_at')
+            # ensure lists
+            if not isinstance(starts, (list, tuple)) or not isinstance(ends, (list, tuple)):
+                continue
+
+            # get server-specific entries; they might be string numbers or None
+            def safe_int(arr, idx):
+                try:
+                    v = arr[idx]
+                    if v is None:
+                        return None
+                    if isinstance(v, (int, float)):
+                        return int(v)
+                    s = str(v).strip()
+                    if s == '' or s.lower() == 'null':
+                        return None
+                    return int(s)
+                except Exception:
+                    return None
+
+            start = safe_int(starts, server_index)
+            end = safe_int(ends, server_index)
+
+            # If both start and end exist, check active
+            if start is not None and end is not None and start <= now_ms <= end:
+                active_candidates.append((int(eid), start, end))
+            else:
+                # compute minimal distance to now (consider start/end if present)
+                d = None
+                if start is not None:
+                    d = abs(start - now_ms)
+                if end is not None:
+                    d2 = abs(end - now_ms)
+                    d = d if (d is not None and d <= d2) else d2
+                if d is not None:
+                    if nearest_dist is None or d < nearest_dist:
+                        nearest_dist = d
+                        nearest_candidate = int(eid)
+        except Exception:
+            continue
+
+    # If multiple active, pick the one with latest start time (most recent)
+    if active_candidates:
+        active_candidates.sort(key=lambda x: x[1], reverse=True)
+        chosen = active_candidates[0][0]
+        logger.info(f"Selected active event for server_index={server_index}: {chosen}")
+        return int(chosen)
+
+    # no active events: return nearest by timestamp
+    if nearest_candidate is not None:
+        logger.info(f"No active event; returning nearest event {nearest_candidate} for server_index={server_index}")
+        return int(nearest_candidate)
+
+    return None
+
 
 # ==========================================
 # 1. 昼夜节律处理器 (SeasonalityHandler)
@@ -52,11 +194,11 @@ class SeasonalityHandler:
         # panic_ease_power 控制在 panic 窗口中 progress->eased 的速率，
         # 值越大越慢接近 target（例如 2.0 或 3.0 会比 0.8 慢得多）
         self.panic_ease_power = float(panic_ease_power)
-        print(f"📅 昼夜节律数据已加载（使用本地小时），全局基准速度均值: {self.global_mean:.4f} panic_ease_power={self.panic_ease_power}")
+        print(f"昼夜节律数据已加载（使用本地小时），全局基准速度均值: {self.global_mean:.4f} panic_ease_power={self.panic_ease_power}")
 
     def _load_json(self, path):
         if not os.path.exists(path):
-            print(f"⚠️ 警告：找不到 {path}，将不使用节律修正。")
+            print(f"警告：找不到 {path}，将不使用节律修正。")
             return {}
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -214,14 +356,19 @@ class CosineModeler:
             popt, _ = curve_fit(func, t_data, y_data, p0=p0, bounds=bounds, maxfev=40000)
             return popt
         except Exception as e:
-            print(f"⚠️ 拟合失败，使用默认参数: {e}")
+            print(f"拟合失败，使用默认参数: {e}")
             return np.array(p0)
 
 # ==========================================
 # 3. 数据处理器 (DataHandler)
 # ==========================================
 class DataHandler:
-    def __init__(self, target_event_id, debug_hours=None, output_dir=None):
+    def __init__(self, target_event_id=None, debug_hours=None, output_dir=None):
+        if target_event_id is None:
+            recent = fetch_recent_json()
+            target_event_id = get_current_event_for_server(recent, server_index=3)
+            if target_event_id is None:
+                raise ValueError("无法自动获取当前活动 ID，请手动指定 target_event_id 参数。")
         self.target_event_id = target_event_id
         self.meta = fetch_event_meta(target_event_id)
         if not self.meta: raise ValueError("元数据获取失败")
@@ -273,41 +420,42 @@ class DataHandler:
         try:
             dt_utc = datetime.utcfromtimestamp(start_ts / 1000)
             utc_hour = dt_utc.hour
-            print(f"🕒 活动开始时间 (UTC): {dt_utc} (Hour: {utc_hour})")
+            print(f"活动开始时间 (UTC): {dt_utc} (Hour: {utc_hour})")
 
             # 如果 UTC 时间本身落在本地常见启动段，认为 API 已返回本地时间或为 UTC+0
             if 10 <= utc_hour <= 19:
-                print("✅ 检测为 UTC/本地时间 (无需偏移)")
+                print("检测为 UTC/本地时间 (无需偏移)")
                 return 0
 
             # 判断是否对应 UTC+8 的本地 10-19 区间
             if 10 <= ((utc_hour + 8) % 24) <= 19:
-                print("✅ 检测为 UTC+8 (CN/CST)")
+                print("检测为 UTC+8 (CN/CST)")
                 return 8
 
             # 判断是否对应 UTC+9 的本地 10-19 区间
             if 10 <= ((utc_hour + 9) % 24) <= 19:
-                print("✅ 检测为 UTC+9 (JP/JST)")
+                print("检测为 UTC+9 (JP/JST)")
                 return 9
 
-            print("⚠️ 无法自动匹配时区，默认使用 UTC+8")
+            print("无法自动匹配时区，默认使用 UTC+8")
             return 8
         except Exception:
             return 8
 
     def load_target_data(self):
-        print(f"🚀 获取目标活动 {self.target_event_id} 数据...")
+        print(f"获取目标活动 {self.target_event_id} 数据...")
         df = fetch_tier_1000_data(self.target_event_id)
         if df is None or df.empty: raise ValueError("T1000 数据为空")
         # 保留未受 debug_hours 限制的完整原始数据，用于绘图真实历史值
         raw_full_df = df.copy()
         
+        # If a debug limit timestamp was set in __init__, trim the fetched data to that point.
         if self.debug_limit_ts:
             df = df[df["time"] <= self.debug_limit_ts].copy()
             
         self.target_scale = self._get_target_current_scale()
         if not self.target_scale: self.target_scale = 20000
-        print(f"⚡ 目标 T10 极速 (Scale): {self.target_scale:.0f}")
+        print(f"目标 T10 极速 (Scale): {self.target_scale:.0f}")
 
         df = calculate_speed_tracker(df)
         df["norm_speed"] = df["speed"] / self.target_scale
@@ -316,6 +464,21 @@ class DataHandler:
         df["hours_elapsed"] = (df["time"] - start_ts) / (1000 * 3600)
         
         self.target_data = df
+        # If debug_hours wasn't provided by the caller, auto-detect current progress
+        # from the loaded data: set debug_hours to the latest observed hours and
+        # debug_limit_ts to the timestamp of the latest observation. This lets
+        # downstream code run without the user having to pass debug_hours.
+        if self.debug_hours is None:
+            try:
+                if len(df) > 0:
+                    last_time = int(df['time'].max())
+                    last_hours = float(df['hours_elapsed'].max())
+                    self.debug_limit_ts = last_time
+                    self.debug_hours = float(last_hours)
+                    logger.info(f"Auto-detected progress: debug_hours={self.debug_hours:.2f}h debug_limit_ts={self.debug_limit_ts}")
+                    print(f"进度自动检测: 已观测 {self.debug_hours:.2f} 小时")
+            except Exception:
+                pass
         # 处理并保存完整未截断的数据供绘图使用（保留原始完整历史）
         try:
             full_df = raw_full_df.copy()
@@ -329,7 +492,7 @@ class DataHandler:
         return df
 
     def find_similar_events(self, count=5):
-        print(f"🔍 寻找同类 [{self.event_type}] 活动...")
+        print(f"寻找同类 [{self.event_type}] 活动...")
         found = 0
         curr = self.target_event_id - 1
         while found < count and curr > self.target_event_id - 200:
@@ -362,20 +525,39 @@ class DataHandler:
                     'total_hours': total_hours, 'start_at': h_start, 'early_intensity': 0
                 })
                 found += 1
-                print(f"✅ 匹配: Event {curr} | Scale: {scale:.0f}")
+                print(f"匹配: Event {curr} | Scale: {scale:.0f}")
             except: pass
             finally: curr -= 1; time.sleep(0.1)
 
-    def run_prediction(self):
-        print("\n🔮 开始预测计算 (模式: 严格时间对齐 Time-Aligned)...")
+    def run_prediction(self, return_type=None):
+        """
+        Run the prediction pipeline.
+
+        Parameters:
+        - return_type: None (default) -> keep previous behavior (save image to disk if output_path available and print path).
+                       'path' -> save plot to file and return the output_path string.
+                       'fig'  -> return the matplotlib Figure object (no file save).
+                       'bytes'-> return PNG image bytes (no file save).
+
+        Returns:
+        - Depending on return_type, may return None, output_path (str), matplotlib.figure.Figure, or bytes.
+        """
+        print("\n开始预测计算 (模式: 严格时间对齐 Time-Aligned)...")
         
         # 1. 确定对比窗口 (Comparison Window)
         # 起点：6小时 (跳过开局暴冲)
-        # 终点：当前时间，但上限锁死在 72小时 (3天)
+        # 终点：使用已观测的最新进度（若 caller 未传入 debug_hours 则已在 load_target_data 自动检测），
+        # 上限锁死在 72 小时 (3天)
         t_start_cmp = 6.0
-        t_end_cmp = min(self.debug_hours, 72.0)
-        
-        print(f"⏱️ 锁定对比区间: [ {t_start_cmp}h ~ {t_end_cmp}h ]")
+        # If debug_hours is not set, use the latest observed hours from target_data
+        try:
+            observed_hours = float(self.target_data['hours_elapsed'].max()) if hasattr(self, 'target_data') and len(self.target_data) > 0 else 0.0
+        except Exception:
+            observed_hours = 0.0
+        end_source = self.debug_hours if (self.debug_hours is not None) else observed_hours
+        t_end_cmp = min(end_source, 72.0)
+
+        print(f"锁定对比区间: [ {t_start_cmp}h ~ {t_end_cmp}h ] (end_source={end_source})")
         
         # 内部函数：计算指定区间的稳健均值
         def get_window_intensity(df_in):
@@ -405,10 +587,10 @@ class DataHandler:
         curr_intensity = get_window_intensity(target_df)
         
         if curr_intensity is None:
-            print("⚠️ 当前活动在对比区间内无有效数据，无法计算 Ratio，默认 1.0")
+            print("当前活动在对比区间内无有效数据，无法计算 Ratio，默认 1.0")
             curr_intensity = 0.1 # 避免除零
             
-        print(f"⚡ 当前活动区间强度: {curr_intensity:.4f}")
+        print(f"当前活动区间强度: {curr_intensity:.4f}")
 
         # 3. 计算【历史活动】在【同一区间】的强度 & 拟合参数
         hist_params = []
@@ -451,11 +633,9 @@ class DataHandler:
                 hist_intensities.append(h_int)
                 hist_params.append(popt)
                 # popt: [Base, A, B, B_end, T_panic]
-                m = f"  - Hist {h['event_id']}: 区间强度={h_int:.4f} | A={popt[1]:.5f} B={popt[2]:.6f} | params={popt}"
-                logger.info(m)
+                logger.info(f"  - Hist {h['event_id']}: 区间强度={h_int:.6f} | A={popt[1]:.8e} B={popt[2]:.8e} | params={popt}")
             else:
-                m = f"  - Hist {h['event_id']}: ⚠️ 在该时间段无数据，跳过对比"
-                logger.info(m)
+                logger.info(f"  - Hist {h['event_id']}: 在该时间段无数据，跳过对比")
 
         # 诊断：比较 norm_speed ratio vs skeleton ratio
         mask_cmp = (target_df['hours_elapsed'] >= t_start_cmp) & (target_df['hours_elapsed'] <= t_end_cmp)
@@ -489,9 +669,6 @@ class DataHandler:
                     norm_ratio = obs_norm_mean / mean_hist_norm
 
             # 选择性地混合两种 ratio：当两者都可用时按时间权重混合（从 skeleton 主导 -> 到 normal 主导）
-            # 混合权重基于已观测时间/总时长：
-            #   w_norm = 0.2 + 0.6 * cos(s * pi - pi)
-            # 其中 s = observed_hours / target_total_hours。最后将权重裁剪到 [0,1]
             skeleton_val = float(skeleton_ratio) if np.isfinite(skeleton_ratio) else None
             norm_val = float(norm_ratio) if (norm_ratio is not None and np.isfinite(norm_ratio)) else None
 
@@ -501,7 +678,6 @@ class DataHandler:
             s = 0.0
             if target_total_hours and target_total_hours > 0:
                 s = np.clip(observed_hours / float(target_total_hours), 0.0, 1.0)
-
             if (s is None): s = 0.0
 
             if skeleton_val is not None and norm_val is not None:
@@ -519,7 +695,7 @@ class DataHandler:
                     chosen_ratio = 1.0
 
             # Clip ratio 以防极端放大/缩小（阈值可调整）
-            R_MIN, R_MAX = 0.5, 1.8
+            R_MIN, R_MAX = 0.25, 4.0
             clipped_ratio = float(np.clip(chosen_ratio, R_MIN, R_MAX))
 
             # 记录诊断信息
@@ -533,9 +709,9 @@ class DataHandler:
                 logger.warning(f"Ratio clipped from {chosen_ratio:.6f} to {clipped_ratio:.6f} (bounds {R_MIN}-{R_MAX})")
 
             ratio = clipped_ratio
-            print(f"⚖️ 强度修正比率 (skeleton/norm/chosen/clipped): {skeleton_ratio:.4f} / {(norm_ratio if norm_ratio is not None else float('nan')):.4f} -> {chosen_ratio:.3f} -> {ratio:.3f}")
+            print(f"强度修正比率 (skeleton/norm/chosen/clipped): {skeleton_ratio:.6f} / {(norm_ratio if norm_ratio is not None else float('nan')):.6f} -> {chosen_ratio:.6f} -> {ratio:.6f}")
         else:
-            print("⚠️ 没有有效的历史对比数据，Ratio 重置为 1.0")
+            print("没有有效的历史对比数据，Ratio 重置为 1.0")
             ratio = 1.0
             avg_hist_intensity = 1.0 # dummy
 
@@ -559,11 +735,20 @@ class DataHandler:
         target_total_hours = (self.meta['end_at'] - self.meta['start_at']) / 3600000
         
         try:
-            print(f"📝 预测参数: Base={pred_params[0]:.3f}, Slope={pred_params[1]:.5f}")
-            logger.info(f"Final pred_params: {pred_params}")
+            # 标准化终端输出格式：更高精度且统一展示所有参数
+            print(
+                f"预测参数: Base={pred_params[0]:.6f}, "
+                f"A={pred_params[1]:.8e}, B={pred_params[2]:.8e}, "
+                f"B_end={pred_params[3]:.6f}, T_panic={int(pred_params[4])}"
+            )
+            logger.info(
+                f"Final pred_params: Base={pred_params[0]:.6f}, A={pred_params[1]:.8e}, "
+                f"B={pred_params[2]:.8e}, B_end={pred_params[3]:.6f}, T_panic={int(pred_params[4])}"
+            )
             logger.debug(f"avg_params: {avg_params}; hist_intensities: {hist_intensities}")
             logger.debug(f"target_scale={self.target_scale}, target_total_hours={target_total_hours}, debug_hours={self.debug_hours}")
-        except: pass
+        except:
+            pass
 
         # 生成曲线 (后续绘图逻辑不变)
         future_t = np.linspace(0, target_total_hours, 1000) 
@@ -811,15 +996,44 @@ class DataHandler:
         try:
             ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             fname = f"pred_{self.target_event_id}_{ts_str}.png"
-            output_path = os.path.join(self.output_dir, fname)
+            output_path = os.path.join(self.output_dir, f"{self.target_event_id}/", fname)
         except Exception:
             output_path = None
 
-        self.plot_final(target_df, future_t, skeleton_pred, norm_adj_full, full_t_score, full_score, output_path=output_path)
+        # call plot_final and optionally capture return; protect with try/except
+        try:
+            print("开始绘图/渲染输出...")
+            plot_ret = self.plot_final(
+                target_df, future_t, skeleton_pred, norm_adj_full, full_t_score, full_score,
+                output_path=output_path, return_type=return_type
+            )
+            # diagnostic: report what plot_final returned
+            try:
+                tname = type(plot_ret).__name__ if plot_ret is not None else 'NoneType'
+            except Exception:
+                tname = str(type(plot_ret))
+            print(f"绘图返回: type={tname}")
+            logger.info(f"plot_final returned type={tname}")
+            if return_type == 'bytes' and plot_ret is not None:
+                try:
+                    print(f"绘图字节大小: {len(plot_ret)} bytes")
+                    logger.info(f"Plot bytes size: {len(plot_ret)}")
+                except Exception:
+                    pass
+        except Exception as e:
+            plot_ret = None
+            logger.exception(f"plot_final failed: {e}")
+            print(f"绘图失败: {e}")
+
         logger.info(f"Prediction complete for event={self.target_event_id}; final_score={int(full_score[-1]) if len(full_score)>0 else 0}")
         logger.info("---- END RUN ----\n")
 
-    def plot_final(self, target_df, t_pred, y_skeleton, y_final, t_score, y_score, output_path=None):
+        # If caller requested a return value, return it
+        if return_type in ('path', 'fig', 'bytes'):
+            return plot_ret
+        return None
+
+    def plot_final(self, target_df, t_pred, y_skeleton, y_final, t_score, y_score, output_path=None, return_type=None):
         """
         Draw prediction plots and save to `output_path` if provided.
 
@@ -919,10 +1133,31 @@ class DataHandler:
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
+
+        # Return behavior for integration (Streamlit etc.)
+        if return_type == 'fig':
+            # Return the Figure object for caller to render; do not close here
+            return fig
+
+        if return_type == 'bytes':
+            try:
+                buf = BytesIO()
+                fig.savefig(buf, format='png', dpi=150)
+                buf.seek(0)
+                img_bytes = buf.getvalue()
+                buf.close()
+                plt.close(fig)
+                return img_bytes
+            except Exception as e:
+                logger.warning(f"Failed to render plot to bytes: {e}")
+                plt.close(fig)
+                return None
+
+        # default / 'path' behavior: save to disk if output_path provided, else show
         if output_path:
             try:
                 fig.savefig(output_path, dpi=150)
-                print(f"📁 预测图已保存: {output_path}")
+                print(f"预测图已保存: {output_path}")
                 logger.info(f"Saved prediction plot to {output_path}")
             except Exception as e:
                 logger.warning(f"Failed to save plot to {output_path}: {e}")
@@ -933,6 +1168,10 @@ class DataHandler:
         print(f"最终预测分数: {int(final_score):,} PT")
         # close the figure to free memory
         plt.close(fig)
+        # when saved to path, return output_path
+        if output_path:
+            return output_path
+        return None
 
 # ==========================================
 # 调试入口
@@ -940,16 +1179,17 @@ class DataHandler:
 if __name__ == "__main__":
     try:
         # 假设预测 xxx，时间冻结在 xxh
-        handler = DataHandler(313, debug_hours=60)
+        # handler = DataHandler(312, debug_hours=60)
+        handler = DataHandler()
         handler.load_target_data()
         handler.find_similar_events()
         
         if handler.history_events:
             handler.run_prediction()
         else:
-            print("😿 没找到历史活动，无法预测。")
+            print("没找到历史活动，无法预测。")
             
     except Exception as e:
-        print(f"❌ 运行出错: {e}")
+        print(f"运行出错: {e}")
         import traceback
         traceback.print_exc()

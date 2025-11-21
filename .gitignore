@@ -7,7 +7,9 @@
 # Allow files
 !predictor.py
 !base_distribution.py
+!app.py
 !base_speed_distribution.json
 !README.md
+!requirements.txt
 !example
 !example/*
