@@ -259,9 +259,10 @@ class SeasonalityHandler:
 
     def remove_seasonality(self, df):
         df = df.copy()
-        # `base_speed_distribution.json` uses local hours. Convert timestamp to naive local
-        # datetime (no additional tz shift) so hour lookup matches the JSON keys.
-        df['dt_local'] = pd.to_datetime(df['time'], unit='ms')
+        # `base_speed_distribution.json` uses local hours. Convert timestamp to local
+        # datetime by applying the detected tz_offset. Use an explicit Timedelta
+        # so behavior is independent of the server/system timezone.
+        df['dt_local'] = pd.to_datetime(df['time'], unit='ms') + pd.Timedelta(hours=self.tz_offset)
         df['season_factor'] = df['dt_local'].apply(self.get_factor)
 
         # --- Early-hour suppression: avoid amplifying early spikes by tiny factors ---
@@ -290,9 +291,12 @@ class SeasonalityHandler:
 
         for i, h in enumerate(t_hours):
             current_ts = start_ts + (h * 3600 * 1000)
-            # base_speed_distribution.json 存储的是本地小时，因此直接将时间戳转为本地
-            # （naive）datetime 用于查表，不再额外添加 tz 偏移。
-            dt_local = datetime.fromtimestamp(current_ts / 1000)
+            # Convert from UTC epoch to a pure UTC datetime, then apply the
+            # configured tz_offset to obtain the activity-local datetime.
+            # This avoids relying on system localtime (which may be UTC on servers)
+            # and ensures consistent seasonality lookup across environments.
+            dt_utc = datetime.utcfromtimestamp(current_ts / 1000)
+            dt_local = dt_utc + timedelta(hours=self.tz_offset)
 
             # 1) 原始节律因子（基于本地小时）
             raw_factor = self.get_factor(dt_local)
@@ -1202,8 +1206,8 @@ class DataHandler:
 if __name__ == "__main__":
     try:
         # 假设预测 xxx，时间冻结在 xxh
-        # handler = DataHandler(312, debug_hours=60)
-        handler = DataHandler()
+        handler = DataHandler(312, debug_hours=60)
+        # handler = DataHandler()
         handler.load_target_data()
         handler.find_similar_events()
         
