@@ -220,13 +220,36 @@ class SeasonalityHandler:
         else:
             dt_obj = dt
             
-        if is_workday is not None:
-            try:
-                if not is_workday(dt_obj.date()): dtype = 'weekend'
-                else: dtype = 'weekday'
-            except: dtype = get_day_type(dt_obj)
+        # Special rules: Friday after 17:00 treated as weekend (players behave like weekend)
+        # and Sunday after 23:00 treated as weekday (late-night rollback to weekday pattern)
+        if isinstance(dt_obj, datetime):
+            if dt_obj.weekday() == 4 and dt_obj.hour >= 17:
+                dtype = 'weekend'
+            elif dt_obj.weekday() == 6 and dt_obj.hour >= 23:
+                dtype = 'weekday'
+            else:
+                # 2. 使用 chinese_calendar（若可用）判断法定节假日/工作日
+                if is_workday is not None:
+                    try:
+                        if is_workday(dt_obj.date()):
+                            dtype = 'weekday'
+                        else:
+                            dtype = 'weekend'
+                    except:
+                        dtype = get_day_type(dt_obj)
+                else:
+                    # 3. Fallback: 普通周末判断
+                    dtype = get_day_type(dt_obj)
         else:
-            dtype = get_day_type(dt_obj)
+            # If dt_obj is not datetime for some reason, fallback
+            if is_workday is not None:
+                try:
+                    if is_workday(dt_obj): dtype = 'weekday'
+                    else: dtype = 'weekend'
+                except:
+                    dtype = get_day_type(dt_obj)
+            else:
+                dtype = get_day_type(dt_obj)
             
         hour = str(dt_obj.hour)
         stats = self.data.get(dtype, {}).get(hour)
@@ -432,7 +455,7 @@ class DataHandler:
                 print("检测为 UTC+8 (CN/CST)")
                 return 8
 
-            # 判断是否对应 UTC+9 的本地 10-19 区间
+            # 判断是否对应 UTC+9 的本地 10-19 区间 （实际搞笑用）
             if 10 <= ((utc_hour + 9) % 24) <= 19:
                 print("检测为 UTC+9 (JP/JST)")
                 return 9

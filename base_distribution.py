@@ -63,7 +63,7 @@ def fetch_top10_max_speed(event_id):
         if df.empty:
             return None
             
-        # 优化：仅处理前 N 条数据以节省性能（如果主人确定极速出现在开局）
+        # 优化：仅处理前 N 条数据以节省性能
         # df = df.head(500) 
         
         # === 核心逻辑：按 UID 分组计算速度 ===
