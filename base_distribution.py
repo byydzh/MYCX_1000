@@ -56,7 +56,6 @@ def fetch_top10_max_speed(event_id):
         
         # 转换为 DataFrame
         # 只需要前 200 条数据通常足够覆盖开局爆发期，但为了保险起见，
-        # 如果想找全局极速，建议处理全部。既然主人提到"前100条"，
         # 我们这里取前 500 条以确保覆盖到至少几小时的数据量，
         # 因为 eventtop 返回的是所有 top10 玩家的点，10个玩家每小时1个点，100条只够10小时。
         df = pd.DataFrame(data["points"]).head(500)
@@ -64,7 +63,7 @@ def fetch_top10_max_speed(event_id):
         if df.empty:
             return None
             
-        # 优化：仅处理前 N 条数据以节省性能（如果主人确定极速出现在开局）
+        # 优化：仅处理前 N 条数据以节省性能
         # df = df.head(500) 
         
         # === 核心逻辑：按 UID 分组计算速度 ===
