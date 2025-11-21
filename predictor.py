@@ -488,20 +488,38 @@ class DataHandler:
                 if mean_hist_norm and mean_hist_norm > 0:
                     norm_ratio = obs_norm_mean / mean_hist_norm
 
-            # 选择性地混合两种 ratio：当两者都可用时取中位数（robust），否则用可用者
-            ratio_candidates = []
-            if np.isfinite(skeleton_ratio):
-                ratio_candidates.append(float(skeleton_ratio))
-            if norm_ratio is not None and np.isfinite(norm_ratio):
-                ratio_candidates.append(float(norm_ratio))
+            # 选择性地混合两种 ratio：当两者都可用时按时间权重混合（从 skeleton 主导 -> 到 normal 主导）
+            # 混合权重基于已观测时间/总时长：
+            #   w_norm = 0.2 + 0.6 * cos(s * pi - pi)
+            # 其中 s = observed_hours / target_total_hours。最后将权重裁剪到 [0,1]
+            skeleton_val = float(skeleton_ratio) if np.isfinite(skeleton_ratio) else None
+            norm_val = float(norm_ratio) if (norm_ratio is not None and np.isfinite(norm_ratio)) else None
 
-            if len(ratio_candidates) == 0:
-                chosen_ratio = 1.0
+            # compute observed progress s (use target window length if available)
+            target_total_hours = 72.0
+            observed_hours = float(target_df['hours_elapsed'].max()) if 'hours_elapsed' in target_df.columns else 0.0
+            s = 0.0
+            if target_total_hours and target_total_hours > 0:
+                s = np.clip(observed_hours / float(target_total_hours), 0.0, 1.0)
+
+            if (s is None): s = 0.0
+
+            if skeleton_val is not None and norm_val is not None:
+                w_norm = 0.2 + 0.6 * np.cos(s * np.pi - np.pi)
+                w_norm = float(np.clip(w_norm, 0.0, 1.0))
+                chosen_ratio = skeleton_val * (1.0 - w_norm) + norm_val * w_norm
+                logger.info(f"Blend ratios using time-weight: s={s:.3f} w_norm={w_norm:.3f} skeleton={skeleton_val:.6f} norm={norm_val:.6f} -> chosen={chosen_ratio:.6f}")
             else:
-                chosen_ratio = float(np.median(ratio_candidates))
+                # fallback to whichever is available, else 1.0
+                if skeleton_val is not None:
+                    chosen_ratio = skeleton_val
+                elif norm_val is not None:
+                    chosen_ratio = norm_val
+                else:
+                    chosen_ratio = 1.0
 
             # Clip ratio 以防极端放大/缩小（阈值可调整）
-            R_MIN, R_MAX = 0.6, 1.6
+            R_MIN, R_MAX = 0.5, 1.8
             clipped_ratio = float(np.clip(chosen_ratio, R_MIN, R_MAX))
 
             # 记录诊断信息
@@ -598,13 +616,29 @@ class DataHandler:
             model_since_cutoff = float(cum_all[idx_now] - (cum_all[idx_cutoff-1] if idx_cutoff > 0 else 0.0))
 
             # observed cumulative before cutoff
+            # Use hours_elapsed to avoid timezone/timestamp misalignment; if no exact
+            # pre-cutoff row exists, fall back to the nearest earlier point (interpolation).
             hist_df = getattr(self, 'full_target_data', self.target_data)
             hist_col = 'ep' if 'ep' in hist_df.columns else ('value' if 'value' in hist_df.columns else None)
             observed_before_cutoff = 0.0
-            if hist_col is not None:
-                before_mask = hist_df['time'] < cutoff_ts
-                if before_mask.any():
-                    observed_before_cutoff = float(hist_df.loc[before_mask, hist_col].iloc[-1])
+            if hist_col is not None and 'hours_elapsed' in hist_df.columns:
+                hrs = hist_df['hours_elapsed'].values
+                scores = hist_df[hist_col].values
+                # prefer rows strictly before cutoff_hours
+                before_mask = hrs < cutoff_hours
+                if np.any(before_mask):
+                    # take latest available score before cutoff
+                    observed_before_cutoff = float(scores[np.where(before_mask)[0][-1]])
+                else:
+                    # no earlier row; attempt to use the earliest available score (usually 0)
+                    observed_before_cutoff = float(scores[0]) if len(scores) > 0 else 0.0
+                logger.debug(f"Observed before cutoff via hours_elapsed: cutoff_hours={cutoff_hours:.3f} observed_before_cutoff={observed_before_cutoff}")
+            else:
+                # fallback to timestamp-based method if hours_elapsed missing
+                if hist_col is not None and 'time' in hist_df.columns:
+                    before_mask = hist_df['time'] < cutoff_ts
+                    if before_mask.any():
+                        observed_before_cutoff = float(hist_df.loc[before_mask, hist_col].iloc[-1])
 
             observed_since_cutoff = float(current_max_score) - observed_before_cutoff
 
@@ -905,8 +939,8 @@ class DataHandler:
 # ==========================================
 if __name__ == "__main__":
     try:
-        # 假设预测 312，时间冻结在 60h
-        handler = DataHandler(312, debug_hours=60)
+        # 假设预测 xxx，时间冻结在 xxh
+        handler = DataHandler(313, debug_hours=60)
         handler.load_target_data()
         handler.find_similar_events()
         
