@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 # 引入后端逻辑
+from config import DEFAULT_CONFIG
 from predictor import DataHandler, fetch_recent_json, get_current_event_for_server
 
 # ==========================================
@@ -32,6 +33,74 @@ st.sidebar.header("控制台 🎮")
 
 manual_btn = st.sidebar.button("⚡ 立即运行预测", type="primary")
 
+# --- 高级参数配置 (Advanced Config) ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("参数设置"):
+    st.caption("调整下列参数将覆盖 config.py 的默认值")
+    
+    # 1. 模型参数
+    st.markdown("**模型参数**")
+    weekend_mult = st.slider(
+        "周末增强系数", 
+        min_value=0.8, max_value=1.5, step=0.05,
+        value=DEFAULT_CONFIG.get('weekend_multiplier', 1.0),
+        help="大于1.0表示预测周末相较工作日会有额外增幅，注意并非一定会让预测值上升，这主要作用于模型预测速度分布的形状"
+    )
+
+    panic_scaler = st.slider(
+        "恐慌期最小加速倍数",
+        min_value=1.0, max_value=3.0, step=0.05,
+        value=DEFAULT_CONFIG.get('panic_scaler', 1.1),
+        help="恐慌期的最小加速倍数，数值越大表示加速效果越明显"
+    )
+
+    panic_ease_power = st.slider(
+        "恐慌期缓动指数",
+        min_value=0.1, max_value=5.0, step=0.1,
+        value=DEFAULT_CONFIG.get('panic_ease_power', 1.0),
+        help="控制恐慌期的缓动效果，数值越大“龙抬头”效果越晚"
+    )
+    
+    similar_count = st.number_input(
+        "参考历史活动数",
+        min_value=1, max_value=10, step=1,
+        value=DEFAULT_CONFIG.get('similar_count', 5),
+        help="不建议调整，更不建议设置太少"
+    )
+
+    st.markdown("以下参数不建议轻易调整")
+
+    # 2. 阈值与限制
+    with st.sidebar.expander("阈值与限制"):
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            ratio_min = st.number_input("Ratio Min", value=DEFAULT_CONFIG.get('ratio_min', 0.25), step=0.05)
+            scale_min = st.number_input("Scale Min", value=DEFAULT_CONFIG.get('scale_min', 0.5), step=0.1)
+            # 对比窗口起始时间 (小时)
+            t_start_cmp = st.number_input(
+                "对比窗口起始 (小时)", min_value=0.0, value=DEFAULT_CONFIG.get('t_start_cmp', 6.0), step=0.5,
+                help="用于计算历史相似性时跳过开局不稳定（常被维护时间占用）的时间（小时）"
+            )
+        with col_p2:
+            ratio_max = st.number_input("Ratio Max", value=DEFAULT_CONFIG.get('ratio_max', 4.0), step=0.1)
+            scale_max = st.number_input("Scale Max", value=DEFAULT_CONFIG.get('scale_max', 2.0), step=0.1)
+            # 对比窗口结束上限 (小时)
+            t_end_cap = st.number_input(
+                "窗口结束上限 (小时)", min_value=1.0, value=DEFAULT_CONFIG.get('t_end_cap', 72.0), step=1.0,
+                help="历史对比时考虑的最大小时数，上限用于避免中后期数据干扰"
+            )
+
+    # 3. 24h 回测修正与顶部平滑阈值
+    with st.sidebar.expander("回测与平滑设置"):
+        corr_min = st.number_input("24h 回测修正下限", value=DEFAULT_CONFIG.get('corr_min', 0.6), step=0.05)
+        corr_max = st.number_input("24h 回测修正上限", value=DEFAULT_CONFIG.get('corr_max', 1.6), step=0.05)
+
+        st.markdown("**顶部平滑阈值**")
+        smooth_thresh1 = st.number_input("轻微衰减阈值 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_thresh1', 0.5), step=0.01)
+        smooth_thresh2 = st.number_input("强力衰减阈值 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_thresh2', 0.65), step=0.01)
+        smooth_hard_cap = st.number_input("绝对硬顶 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_hard_cap', 0.8), step=0.01)
+
+# --- 调试回测 ---
 st.sidebar.markdown("---")
 st.sidebar.header("调试回测 🛠️")
 enable_debug = st.sidebar.checkbox("启用调试/回测模式", value=False)
@@ -42,6 +111,7 @@ if enable_debug:
 else:
     debug_event_id = None
     debug_hours_input = None
+
 
 # ==========================================
 # 4. 核心逻辑 (首次自动 + 手动触发)
@@ -75,7 +145,32 @@ if should_run:
             if target_event_id is None:
                 st.error("未找到活动 ID！")
             else:
-                handler = DataHandler(target_event_id, debug_hours=target_debug_hours)
+                # --- 构建配置覆盖字典 ---
+                user_config_overrides = {
+                    'weekend_multiplier': weekend_mult,
+                    'panic_scaler': float(panic_scaler),
+                    'panic_ease_power': float(panic_ease_power),
+                    'similar_count': int(similar_count),
+                    'ratio_min': float(ratio_min),
+                    'ratio_max': float(ratio_max),
+                    'scale_min': float(scale_min),
+                    'scale_max': float(scale_max),
+                    't_start_cmp': float(t_start_cmp),
+                    't_end_cap': float(t_end_cap),
+                    'corr_min': float(corr_min),
+                    'corr_max': float(corr_max),
+                    'smooth_thresh1': float(smooth_thresh1),
+                    'smooth_thresh2': float(smooth_thresh2),
+                    'smooth_hard_cap': float(smooth_hard_cap)
+                }
+
+                # --- 传入 config_overrides ---
+                handler = DataHandler(
+                    target_event_id, 
+                    debug_hours=target_debug_hours,
+                    config_overrides=user_config_overrides
+                )
+                
                 handler.load_target_data()
                 handler.find_similar_events()
 

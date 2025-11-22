@@ -8,6 +8,7 @@
 !predictor.py
 !base_distribution.py
 !app.py
+!config.py
 !base_speed_distribution.json
 !README.md
 !requirements.txt
