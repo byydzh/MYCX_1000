@@ -27,6 +27,8 @@ try:
 except Exception:
     is_workday = None
 
+from config import DEFAULT_CONFIG
+
 # Setup logger for detailed run diagnostics (file-only; do not print logs to terminal)
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'predictor.log')
 logger = logging.getLogger('predictor')
@@ -185,16 +187,26 @@ def get_current_event_for_server(recent_json=None, server_index=3, now_ts_ms=Non
 # 1. 昼夜节律处理器 (SeasonalityHandler)
 # ==========================================
 class SeasonalityHandler:
-    def __init__(self, json_path='base_speed_distribution.json', tz_offset=8, panic_ease_power=1.0):
+    def __init__(self, json_path='base_speed_distribution.json', tz_offset=8, panic_ease_power=1.0, weekend_multiplier=1.0, panic_scaler=1.1):
         self.data = self._load_json(json_path)
-        self.global_mean = self._calculate_global_mean()
+
+        if weekend_multiplier != 1.0:
+            print(f"正在应用周末增强系数: x{weekend_multiplier} 喵！")
+            self._apply_multiplier('weekend', weekend_multiplier)
+        
+        # 修正逻辑：分别计算平日和周末的均值，再进行 5:2 加权合成
+        self.wd_mean, self.we_mean, self.global_mean = self._calculate_weighted_means()
+        
         # 注意: `base_speed_distribution.json` 中的小时数据已经是当地时区的小时
         # 因此不再对时间戳进行额外的时区偏移。保留 tz_offset 属性仅作兼容。
         self.tz_offset = tz_offset
-        # panic_ease_power 控制在 panic 窗口中 progress->eased 的速率，
-        # 值越大越慢接近 target（例如 2.0 或 3.0 会比 0.8 慢得多）
         self.panic_ease_power = float(panic_ease_power)
-        print(f"昼夜节律数据已加载，全局基准速度均值: {self.global_mean:.4f} panic_ease_power={self.panic_ease_power}")
+        self.panic_scaler = float(panic_scaler)
+        
+        print(f"昼夜节律数据已加载:")
+        # print(f"  - 平日基准均值 (Weekday): {self.wd_mean:.6f}")
+        # print(f"  - 周末基准均值 (Weekend): {self.we_mean:.6f}")
+        # print(f"  - 全局加权均值 (Weighted Global): {self.global_mean:.6f} (panic_ease={self.panic_ease_power})")
 
     def _load_json(self, path):
         if not os.path.exists(path):
@@ -202,16 +214,39 @@ class SeasonalityHandler:
             return {}
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
+        
+    def _apply_multiplier(self, dtype, multiplier):
+        """直接修改 self.data 字典中的均值数据"""
+        if dtype not in self.data: return
+        for hour_key in self.data[dtype]:
+            if 'mean' in self.data[dtype][hour_key]:
+                self.data[dtype][hour_key]['mean'] *= multiplier
 
-    def _calculate_global_mean(self):
-        if not self.data: return 1.0
-        values = []
-        for dtype in ['weekday', 'weekend']:
+    def _calculate_weighted_means(self):
+        """
+        分别计算平日和周末的日均速度，并按 5:2 权重合成全局均值。
+        这样可以防止因周末/平日数据量不均导致的基准偏差。
+        """
+        if not self.data: return 1.0, 1.0, 1.0
+        
+        def get_day_type_mean(dtype):
+            values = []
+            # 遍历 0-23 小时
             for h in range(24):
                 item = self.data.get(dtype, {}).get(str(h))
-                if item and item['count'] > 0:
+                if item and item.get('mean', 0) > 0:
                     values.append(item['mean'])
-        return np.mean(values) if values else 1.0
+            # 如果该类型没有数据，返回 1.0 避免除零，否则返回该类型一天的平均速度
+            return np.mean(values) if values else 1.0
+
+        wd_mean = get_day_type_mean('weekday')
+        we_mean = get_day_type_mean('weekend')
+        
+        # 核心修正：加权平均 (平日5天，周末2天)
+        # 这样算出来的 global_mean 才是这一周真实的“期望速度”
+        weighted_global = (wd_mean * 5.0 + we_mean * 2.0) / 7.0
+        
+        return wd_mean, we_mean, weighted_global
 
     def get_factor(self, dt):
         if not self.data: return 1.0
@@ -253,6 +288,9 @@ class SeasonalityHandler:
             
         hour = str(dt_obj.hour)
         stats = self.data.get(dtype, {}).get(hour)
+        
+        # 这里的逻辑保持不变：用当前小时的均值除以【全局加权均值】
+        # 这样如果 dtype 是 weekend，分子通常较大，Factor > 1.0，正确反映周末加速
         if stats and stats['mean'] > 0:
             return stats['mean'] / self.global_mean
         return 1.0 
@@ -260,15 +298,11 @@ class SeasonalityHandler:
     def remove_seasonality(self, df):
         df = df.copy()
         # `base_speed_distribution.json` uses local hours. Convert timestamp to local
-        # datetime by applying the detected tz_offset. Use an explicit Timedelta
-        # so behavior is independent of the server/system timezone.
+        # datetime by applying the detected tz_offset.
         df['dt_local'] = pd.to_datetime(df['time'], unit='ms') + pd.Timedelta(hours=self.tz_offset)
         df['season_factor'] = df['dt_local'].apply(self.get_factor)
 
-        # --- Early-hour suppression: avoid amplifying early spikes by tiny factors ---
-        # If the dataframe contains a precomputed `hours_elapsed` column, treat the
-        # first 12 hours as an 'adrenaline' period and prevent season_factor < 1.0
-        # from shrinking norm_speed (which would inflate skeleton_speed).
+        # --- Early-hour suppression ---
         if 'hours_elapsed' in df.columns:
             mask_early = (df['hours_elapsed'] < 12.0) & (df['season_factor'] < 1.0)
             if mask_early.any():
@@ -278,44 +312,25 @@ class SeasonalityHandler:
         return df
 
     def apply_seasonality(self, t_hours, y_skeleton, start_ts, total_hours=None, t_panic=24.0):
-        """
-        Apply seasonality factors to a skeleton speed series.
-
-        Extended with an "adrenaline" mechanism: when time enters the final
-        `t_panic` hours (counting down from `total_hours`), the seasonality
-        effect is linearly blended back toward a neutral factor (>=1.0) to
-        simulate players ignoring day/night and ramping up performance.
-        """
         y_final = []
         factors = []
 
         for i, h in enumerate(t_hours):
             current_ts = start_ts + (h * 3600 * 1000)
-            # Convert from UTC epoch to a pure UTC datetime, then apply the
-            # configured tz_offset to obtain the activity-local datetime.
-            # This avoids relying on system localtime (which may be UTC on servers)
-            # and ensures consistent seasonality lookup across environments.
             dt_utc = datetime.fromtimestamp(current_ts / 1000, timezone.utc)
             dt_local = dt_utc + timedelta(hours=self.tz_offset)
 
             # 1) 原始节律因子
             raw_factor = self.get_factor(dt_local)
 
-            # 2) 恐慌/肾上腺素修正（如果提供了 total_hours）
+            # 2) 恐慌/肾上腺素修正
             final_factor = raw_factor
             if (total_hours is not None) and (t_panic is not None) and t_panic > 0:
                 time_left = total_hours - h
                 if time_left < t_panic:
-                    # progress: 0.0 -> 1.0 as we move through panic window
                     progress = 1.0 - (max(0.0, time_left) / float(t_panic))
-
-                    # 使用可配置的非线性缓动：增大幂次可使得在 panic 窗口早期更慢接近目标因子
                     eased = float(np.power(progress, self.panic_ease_power)) if progress > 0 else 0.0
-
-                    # 目标因子提高到更高水平以模拟更激进的冲刺期（可调）
-                    target_factor = max(raw_factor, 1.0)
-
-                    # 非线性插值（快速上升到 target_factor）
+                    target_factor = max(raw_factor, self.panic_scaler)
                     final_factor = raw_factor * (1.0 - eased) + target_factor * eased
 
             factors.append(final_factor)
@@ -390,7 +405,22 @@ class CosineModeler:
 # 3. 数据处理器 (DataHandler)
 # ==========================================
 class DataHandler:
-    def __init__(self, target_event_id=None, debug_hours=None, output_dir=None):
+    def __init__(self, target_event_id=None, debug_hours=None, output_dir=None, config_overrides=None):
+
+        # 1. 加载配置：复制默认配置，避免修改全局变量
+        self.config = DEFAULT_CONFIG.copy()
+        
+        # 2. 应用覆盖：如果传入了新的参数，更新配置
+        if config_overrides:
+            # 简单的键检查，防止传入无效参数（可选）
+            valid_keys = set(self.config.keys())
+            filtered_overrides = {k: v for k, v in config_overrides.items() if k in valid_keys}
+            if len(filtered_overrides) < len(config_overrides):
+                logger.warning(f"Ignored invalid config keys: {set(config_overrides) - valid_keys}")
+            
+            self.config.update(filtered_overrides)
+            # print(f"已应用自定义配置参数: {list(filtered_overrides.keys())} 喵！")
+            
         if target_event_id is None:
             recent = fetch_recent_json()
             target_event_id = get_current_event_for_server(recent, server_index=3)
@@ -410,7 +440,13 @@ class DataHandler:
         # Output directory for saved plots (default: ./output)
         self.output_dir = output_dir if output_dir is not None else os.path.join('.', 'output')
 
-        self.seasonality = SeasonalityHandler(tz_offset=detected_offset)
+        # Use configured weekend multiplier and panic ease power when creating seasonality handler
+        self.seasonality = SeasonalityHandler(
+            tz_offset=detected_offset,
+            panic_ease_power=float(self.config.get('panic_ease_power', 1.0)),
+            weekend_multiplier=float(self.config.get('weekend_multiplier', 1.0)),
+            panic_scaler=float(self.config.get('panic_scaler', 1.1))
+        )
         self.modeler = CosineModeler() # 👈 使用下凹正弦上升模型
         
         self.history_events = []
@@ -568,7 +604,7 @@ class DataHandler:
             # print(f"Error processing event {curr}: {e}")
             return None
 
-    def find_similar_events(self, count=5):
+    def find_similar_events(self, count=None):
         print(f"寻找同类 [{self.event_type}] 活动...")
         from concurrent.futures import ThreadPoolExecutor, as_completed
         # 优化路径：试图使用 bestdori 提供的全量索引以快速定位同类型活动 做标记
@@ -598,6 +634,10 @@ class DataHandler:
         except Exception as e:
             logger.debug(f"Failed to fetch fast index {idx_url}: {e}")
             candidates = []
+
+        # determine desired similar count from config if not provided
+        if count is None:
+            count = int(self.config.get('similar_count', 5))
 
         found = 0
         # 建议 max_workers 设置为 4~8，太高容易被服务器拒绝服务
@@ -659,17 +699,17 @@ class DataHandler:
         print("\n开始预测计算 (模式: 严格时间对齐 Time-Aligned)...")
         
         # 1. 确定对比窗口 (Comparison Window)
-        # 起点：6小时 (跳过开局暴冲)
+        # 起点：配置中指定 (默认6小时，用于跳过开局暴冲)
         # 终点：使用已观测的最新进度（若 caller 未传入 debug_hours 则已在 load_target_data 自动检测），
-        # 上限锁死在 72 小时 (3天)
-        t_start_cmp = 6.0
+        # 上限由配置项 t_end_cap 控制（默认72小时）
+        t_start_cmp = float(self.config.get('t_start_cmp', 6.0))
         # If debug_hours is not set, use the latest observed hours from target_data
         try:
             observed_hours = float(self.target_data['hours_elapsed'].max()) if hasattr(self, 'target_data') and len(self.target_data) > 0 else 0.0
         except Exception:
             observed_hours = 0.0
         end_source = self.debug_hours if (self.debug_hours is not None) else observed_hours
-        t_end_cmp = min(end_source, 72.0)
+        t_end_cmp = min(end_source, float(self.config.get('t_end_cap', 72.0)))
 
         print(f"锁定对比区间: [ {t_start_cmp}h ~ {t_end_cmp}h ] (end_source={end_source})")
         
@@ -786,8 +826,8 @@ class DataHandler:
             skeleton_val = float(skeleton_ratio) if np.isfinite(skeleton_ratio) else None
             norm_val = float(norm_ratio) if (norm_ratio is not None and np.isfinite(norm_ratio)) else None
 
-            # compute observed progress s (use target window length if available)
-            target_total_hours = 72.0
+            # compute observed progress s (use configured target window length if available)
+            target_total_hours = float(self.config.get('t_end_cap', 72.0))
             observed_hours = float(target_df['hours_elapsed'].max()) if 'hours_elapsed' in target_df.columns else 0.0
             s = 0.0
             if target_total_hours and target_total_hours > 0:
@@ -808,8 +848,9 @@ class DataHandler:
                 else:
                     chosen_ratio = 1.0
 
-            # Clip ratio 以防极端放大/缩小（阈值可调整）
-            R_MIN, R_MAX = 0.25, 4.0
+            # Clip ratio 以防极端放大/缩小（阈值来自配置）
+            R_MIN = float(self.config.get('ratio_min', 0.25))
+            R_MAX = float(self.config.get('ratio_max', 4.0))
             clipped_ratio = float(np.clip(chosen_ratio, R_MIN, R_MAX))
 
             # 记录诊断信息
@@ -946,7 +987,8 @@ class DataHandler:
             else:
                 raw_scale = 1.0
 
-            SCALE_MIN, SCALE_MAX = 0.5, 2.0
+            SCALE_MIN = float(self.config.get('scale_min', 0.5))
+            SCALE_MAX = float(self.config.get('scale_max', 2.0))
             scale_factor = float(np.clip(raw_scale, SCALE_MIN, SCALE_MAX))
             if scale_factor != raw_scale:
                 logger.warning(f"Output scaling clipped {raw_scale:.6f} -> {scale_factor:.6f}")
@@ -994,7 +1036,8 @@ class DataHandler:
 
                         if (model_24 > 0) and (observed_24 is not None) and (observed_24 >= 0):
                             raw_corr = observed_24 / model_24 if model_24 > 0 else 1.0
-                            CORR_MIN, CORR_MAX = 0.6, 1.6
+                            CORR_MIN = float(self.config.get('corr_min', 0.6))
+                            CORR_MAX = float(self.config.get('corr_max', 1.6))
                             corr = float(np.clip(raw_corr, CORR_MIN, CORR_MAX))
                             if corr != raw_corr:
                                 logger.warning(f"24h correction clipped {raw_corr:.6f} -> {corr:.6f}")
@@ -1027,13 +1070,10 @@ class DataHandler:
             # This operates in normalized units (relative to target_scale) AFTER final_scale.
             try:
                 norm_after_scale = speed_pred_clip * float(final_scale)
-                # Two-stage attenuation:
-                # - mild smoothing between 0.5 and 0.65
-                # - strong, nonlinear damping above 0.65 to make reaching 0.7+ unlikely
-                # - enforce a hard cap below 0.8 so 0.8 is strictly unreachable
-                THRESH1 = 0.5
-                THRESH2 = 0.65
-                HARD_CAP = 0.8
+                # Two-stage attenuation with configured thresholds
+                THRESH1 = float(self.config.get('smooth_thresh1', 0.5))
+                THRESH2 = float(self.config.get('smooth_thresh2', 0.65))
+                HARD_CAP = float(self.config.get('smooth_hard_cap', 0.8))
                 ALPHA = 3.0   # mild stage coefficient
                 BETA = 22.0   # strong stage coefficient (large -> heavy compression)
 
@@ -1053,7 +1093,7 @@ class DataHandler:
                     attenuation2 = 1.0 / (1.0 + BETA * (excess2 ** 2))
                     norm_adj[mask_stage2] = THRESH2 + (norm_after_scale[mask_stage2] - THRESH2) * attenuation2
 
-                # Enforce hard cap so 0.8 is unreachable
+                # Enforce hard cap
                 norm_adj = np.minimum(norm_adj, HARD_CAP)
 
                 if np.any(norm_adj != norm_after_scale):
@@ -1081,10 +1121,10 @@ class DataHandler:
             final_scale_for_plot = float(locals().get('applied_scale_factor', locals().get('scale_factor', 1.0)))
             adj_norm_full = speed_pred * final_scale_for_plot
 
-            # reuse same smoothing parameters as applied earlier
-            THRESH1 = 0.5
-            THRESH2 = 0.65
-            HARD_CAP = 0.8
+            # reuse same smoothing parameters as applied earlier (from config)
+            THRESH1 = float(self.config.get('smooth_thresh1', 0.5))
+            THRESH2 = float(self.config.get('smooth_thresh2', 0.65))
+            HARD_CAP = float(self.config.get('smooth_hard_cap', 0.8))
             ALPHA = 3.0
             BETA = 22.0
 
@@ -1126,11 +1166,11 @@ class DataHandler:
                 tname = type(plot_ret).__name__ if plot_ret is not None else 'NoneType'
             except Exception:
                 tname = str(type(plot_ret))
-            print(f"绘图返回: type={tname}")
+            # print(f"绘图返回: type={tname}")
             logger.info(f"plot_final returned type={tname}")
             if return_type == 'bytes' and plot_ret is not None:
                 try:
-                    print(f"绘图字节大小: {len(plot_ret)} bytes")
+                    # print(f"绘图字节大小: {len(plot_ret)} bytes")
                     logger.info(f"Plot bytes size: {len(plot_ret)}")
                 except Exception:
                     pass
@@ -1302,7 +1342,7 @@ class DataHandler:
 if __name__ == "__main__":
     try:
         # 假设预测 xxx，时间冻结在 xxh
-        # handler = DataHandler(312, debug_hours=60)
+        # handler = DataHandler(276, debug_hours=60)
         handler = DataHandler()
         handler.load_target_data()
         handler.find_similar_events()
