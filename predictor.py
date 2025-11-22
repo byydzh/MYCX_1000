@@ -518,43 +518,130 @@ class DataHandler:
             self.full_target_data = df.copy()
         return df
 
+    def _process_single_candidate(self, curr):
+        """
+        处理单个活动 ID 的辅助函数，用于线程池调用。
+        如果符合条件并成功获取数据，返回处理好的数据字典；否则返回 None。
+        """
+        try:
+            # 1. 获取 Meta 并检查类型
+            meta = fetch_event_meta(curr)
+            if not meta or meta.get('event_type') != self.event_type:
+                return None
+
+            # 2. 获取 T10 极速 (Scale)
+            scale = fetch_top10_max_speed(curr)
+            if not scale or scale <= 0:
+                return None
+
+            # 3. 获取 T1000 历史数据
+            df_hist = fetch_tier_1000_data(curr)
+            if df_hist is None or df_hist.empty:
+                return None
+
+            # 4. 数据处理与归一化
+            df_hist = calculate_speed_tracker(df_hist)
+            df_hist['norm_speed'] = df_hist['speed'] / scale
+
+            # 5. 时间计算 (使用 meta 中的时间，确保准确性)
+            h_start = meta.get('start_at')
+            h_end = meta.get('aggregate_at') or meta.get('end_at')
+
+            if h_start is None or h_end is None:
+                return None
+
+            df_hist['hours_elapsed'] = (df_hist['time'] - h_start) / (1000 * 3600)
+            total_hours = (h_end - h_start) / 3600000
+
+            # 返回成功的数据包
+            return {
+                'event_id': curr,
+                'scale': scale,
+                'data': df_hist,
+                'total_hours': total_hours,
+                'start_at': h_start,
+                'early_intensity': 0
+            }
+
+        except Exception as e:
+            # 线程中的异常最好捕获打印，防止炸掉整个线程池
+            # print(f"Error processing event {curr}: {e}")
+            return None
+
     def find_similar_events(self, count=5):
         print(f"寻找同类 [{self.event_type}] 活动...")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # 优化路径：试图使用 bestdori 提供的全量索引以快速定位同类型活动 做标记
+        # 减少逐一 fetch meta 的开销。若索引不可用或解析失败，回退到线性扫描。
+        candidates = []
+        try:
+            idx_url = "https://bestdori.com/api/events/all.3.json"
+            r = requests.get(idx_url, timeout=8)
+            if r.ok:
+                all_idx = r.json()
+                for eid_s, meta in all_idx.items():
+                    try:
+                        eid = int(eid_s)
+                    except Exception:
+                        continue
+                    # only consider events that are strictly older than the target
+                    if eid >= self.target_event_id:
+                        continue
+                    # eventType field in index may be 'eventType'
+                    et = None
+                    if isinstance(meta, dict):
+                        et = meta.get('eventType') or meta.get('event_type')
+                    if et and isinstance(et, str) and et.lower() == str(self.event_type).lower():
+                        candidates.append(eid)
+                # newest first
+                candidates.sort(reverse=True)
+        except Exception as e:
+            logger.debug(f"Failed to fetch fast index {idx_url}: {e}")
+            candidates = []
+
         found = 0
-        curr = self.target_event_id - 1
-        while found < count and curr > self.target_event_id - 200:
+        # 建议 max_workers 设置为 4~8，太高容易被服务器拒绝服务
+        max_workers = 5 
+        
+        # 如果 candidates 列表为空（索引失败），则生成一个回退的 ID 列表
+        if not candidates:
+            # 比如从 target_event_id - 1 往前推 200 个
+            candidates = list(range(self.target_event_id - 1, self.target_event_id - 201, -1))
+
+        # print(f"开始并发扫描，待选列表长度: {len(candidates)}，目标数量: {count} 喵...")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            # future_to_eid 是一个字典，用于追踪哪个 future 对应哪个 event_id
+            future_to_eid = {
+                executor.submit(self._process_single_candidate, eid): eid 
+                for eid in candidates
+            }
+
             try:
-                meta = fetch_event_meta(curr)
-                if not meta or meta.get('event_type') != self.event_type:
-                    # print(f"⚠️ Event {curr} 是 {meta.get('event_type', 'unknown')}，跳过")
-                    continue
-                
-                scale = fetch_top10_max_speed(curr)
-                if not scale or scale <= 0: 
-                    # print(f"⚠️ Event {curr} 获取 T10 极速失败")
-                    continue
-                
-                df_hist = fetch_tier_1000_data(curr)
-                if df_hist is None or df_hist.empty: 
-                    # print(f"⚠️ Event {curr} 获取 T1000 数据失败")
-                    continue
-                
-                df_hist = calculate_speed_tracker(df_hist)
-                df_hist['norm_speed'] = df_hist['speed'] / scale
-                
-                h_start = meta['start_at']
-                h_end = meta.get('aggregate_at') or meta.get('end_at')
-                df_hist['hours_elapsed'] = (df_hist['time'] - h_start) / (1000 * 3600)
-                total_hours = (h_end - h_start) / 3600000
-                
-                self.history_events.append({
-                    'event_id': curr, 'scale': scale, 'data': df_hist,
-                    'total_hours': total_hours, 'start_at': h_start, 'early_intensity': 0
-                })
-                found += 1
-                print(f"匹配: Event {curr} | Scale: {scale:.0f}")
-            except: pass
-            finally: curr -= 1; time.sleep(0.1)
+                # as_completed 会在某个线程完成时立即 yield
+                for future in as_completed(future_to_eid):
+                    eid = future_to_eid[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            self.history_events.append(result)
+                            found += 1
+                            print(f"匹配成功: Event {result['event_id']} | Scale: {result['scale']:.0f}")
+
+                            # 如果已经找到了足够的数量，就不需要再等待剩下的了
+                            if found >= count:
+                                # print("已收集足够数据，停止扫描")
+                                # 取消剩余未执行的任务（正在执行的无法强制中断，但不会处理结果了）
+                                for f in future_to_eid:
+                                    f.cancel()
+                                break
+                    except Exception as exc:
+                        print(f"Event {eid} generated an exception: {exc}")
+            except KeyboardInterrupt:
+                print("手动停止了扫描")
+                executor.shutdown(wait=False)
+                raise
 
     def run_prediction(self, return_type=None):
         """
