@@ -251,7 +251,7 @@ class SeasonalityHandler:
     def get_factor(self, dt):
         if not self.data: return 1.0
         if isinstance(dt, (int, float)): 
-            dt_obj = datetime.fromtimestamp(dt / 1000)
+            dt_obj = datetime.fromtimestamp(dt / 1000) + timedelta(hours=self.tz_offset)
         else:
             dt_obj = dt
             
@@ -761,7 +761,7 @@ class DataHandler:
                 h_start_ts = h.get('start_at')
                 df_for_fit = df_clean.copy()
                 if h_start_ts is not None:
-                    start_dt = datetime.fromtimestamp(h_start_ts / 1000)
+                    start_dt = datetime.fromtimestamp(h_start_ts / 1000, timezone.utc) + timedelta(hours=self.seasonality.tz_offset)
                     cutoff_dt = start_dt.replace(hour=18, minute=0, second=0, microsecond=0)
                     cutoff_ts = int(cutoff_dt.timestamp() * 1000)
                     # 若 cutoff 在 start 之前（即活动在当天 18:00 之后开始），则不会丢弃任何数据
