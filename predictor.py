@@ -940,7 +940,7 @@ class DataHandler:
 
             # cutoff hours (first day 18:00)
             start_ts = self.meta['start_at']
-            start_dt = datetime.fromtimestamp(start_ts / 1000)
+            start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone(timedelta(hours=self.seasonality.tz_offset)))
             cutoff_dt = start_dt.replace(hour=18, minute=0, second=0, microsecond=0)
             cutoff_ts = int(cutoff_dt.timestamp() * 1000)
             cutoff_hours = (cutoff_ts - start_ts) / (1000.0 * 3600.0)
