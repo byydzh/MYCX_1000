@@ -102,8 +102,8 @@ with st.sidebar.expander("参数设置"):
 
 # --- 调试回测 ---
 st.sidebar.markdown("---")
-st.sidebar.header("调试回测 🛠️")
-enable_debug = st.sidebar.checkbox("启用调试/回测模式", value=False)
+st.sidebar.header("调试测试 🛠️")
+enable_debug = st.sidebar.checkbox("启用调试模式", value=False)
 
 if enable_debug:
     debug_event_id = st.sidebar.number_input("目标 Event ID", min_value=1, value=312, step=1)

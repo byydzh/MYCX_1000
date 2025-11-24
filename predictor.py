@@ -4,7 +4,8 @@ import numpy as np
 import json
 import os
 import time
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from scipy.optimize import curve_fit
@@ -28,6 +29,17 @@ except Exception:
     is_workday = None
 
 from config import DEFAULT_CONFIG
+
+# Create a module-level requests Session to enable connection reuse and
+# avoid creating many short-lived sockets (prevents FD exhaustion/time_wait)
+HTTP_SESSION = requests.Session()
+try:
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=3)
+    HTTP_SESSION.mount('http://', adapter)
+    HTTP_SESSION.mount('https://', adapter)
+except Exception:
+    # if adapter creation fails for any reason, keep using default session
+    pass
 
 # Setup logger for detailed run diagnostics (file-only; do not print logs to terminal)
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'predictor.log')
@@ -65,7 +77,7 @@ def fetch_recent_json(timeout=10):
     """Fetch Bestdori recent.json and return parsed JSON or None on failure."""
     url = "https://bestdori.com/api/news/dynamic/recent.json"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = HTTP_SESSION.get(url, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -453,16 +465,37 @@ class DataHandler:
         self.target_data = None
         self.target_scale = 1.0
         self.debug_limit_ts = None
+        # use the shared HTTP session for all network I/O in this handler
+        self.session = HTTP_SESSION
+        # flag: we do not own the module-level session (so close() won't shut it down)
+        self._owns_session = False
         
         if debug_hours:
             self.debug_limit_ts = self.meta['start_at'] + (debug_hours * 3600 * 1000)
             print(f"[调试模式] 时间冻结在: +{debug_hours}h")
             logger.info(f"Debug mode: time frozen at +{debug_hours}h (limit_ts={self.debug_limit_ts})")
 
+    def close(self):
+        """Close any owned session. Module-level session is not owned by instances."""
+        try:
+            if getattr(self, '_owns_session', False) and hasattr(self, 'session') and self.session is not None:
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _get_target_current_scale(self):
         url = f"{BASE_URL}eventtop/data?server={SERVER}&event={self.target_event_id}&mid=0&interval=3600000"
         try:
-            data = requests.get(url, timeout=10).json()
+            data = self.session.get(url, timeout=10).json()
             if not data or "points" not in data: return None
             df = pd.DataFrame(data["points"])
             if self.debug_limit_ts: df = df[df["time"] <= self.debug_limit_ts].copy()
@@ -612,7 +645,7 @@ class DataHandler:
         candidates = []
         try:
             idx_url = "https://bestdori.com/api/events/all.3.json"
-            r = requests.get(idx_url, timeout=8)
+            r = self.session.get(idx_url, timeout=8)
             if r.ok:
                 all_idx = r.json()
                 for eid_s, meta in all_idx.items():
@@ -645,8 +678,8 @@ class DataHandler:
         
         # 如果 candidates 列表为空（索引失败），则生成一个回退的 ID 列表
         if not candidates:
-            # 比如从 target_event_id - 1 往前推 200 个
-            candidates = list(range(self.target_event_id - 1, self.target_event_id - 201, -1))
+            # 比如从 target_event_id - 1 往前推 50 个
+            candidates = list(range(self.target_event_id - 1, self.target_event_id - 51, -1))
 
         # print(f"开始并发扫描，待选列表长度: {len(candidates)}，目标数量: {count} 喵...")
 
@@ -1207,7 +1240,10 @@ class DataHandler:
                 except Exception as e:
                     logger.warning(f"Failed to create output directory {out_dir}: {e}")
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        # Use object-oriented Figure to avoid pyplot global state (safer for servers)
+        fig = Figure(figsize=(12, 10))
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
         
         # --- 子图1: 速度曲线 ---
         ax1.scatter(target_df['hours_elapsed'], target_df['skeleton_speed'], 
@@ -1286,7 +1322,11 @@ class DataHandler:
         ax2.legend(loc='lower right')
         ax2.grid(True, alpha=0.3)
         
-        plt.tight_layout()
+        # use Figure.tight_layout to avoid pyplot
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
 
         # --- 添加水印 (适用于 fig/bytes/path 三种返回方式) ---
         try:
@@ -1305,15 +1345,24 @@ class DataHandler:
         if return_type == 'bytes':
             try:
                 buf = BytesIO()
-                fig.savefig(buf, format='png', dpi=150)
+                FigureCanvasAgg(fig).print_png(buf)
                 buf.seek(0)
                 img_bytes = buf.getvalue()
                 buf.close()
-                plt.close(fig)
+                # clean up
+                try:
+                    fig.clf()
+                    del fig
+                except Exception:
+                    pass
                 return img_bytes
             except Exception as e:
                 logger.warning(f"Failed to render plot to bytes: {e}")
-                plt.close(fig)
+                try:
+                    fig.clf()
+                    del fig
+                except Exception:
+                    pass
                 return None
 
         # default / 'path' behavior: save to disk if output_path provided, else show
@@ -1324,13 +1373,29 @@ class DataHandler:
                 logger.info(f"Saved prediction plot to {output_path}")
             except Exception as e:
                 logger.warning(f"Failed to save plot to {output_path}: {e}")
-                plt.show()
+                # render to buffer as fallback (headless-safe)
+                try:
+                    buf = BytesIO()
+                    FigureCanvasAgg(fig).print_png(buf)
+                    buf.close()
+                except Exception:
+                    pass
         else:
-            plt.show()
+            # headless environment: render to buffer and discard (no interactive show)
+            try:
+                buf = BytesIO()
+                FigureCanvasAgg(fig).print_png(buf)
+                buf.close()
+            except Exception:
+                pass
 
         print(f"最终预测分数: {int(final_score):,} PT")
-        # close the figure to free memory
-        plt.close(fig)
+        # close/clear the figure to free memory
+        try:
+            fig.clf()
+            del fig
+        except Exception:
+            pass
         # when saved to path, return output_path
         if output_path:
             return output_path

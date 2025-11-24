@@ -6,7 +6,18 @@ import json
 from datetime import datetime, timedelta
 import os
 from chinese_calendar import is_workday
-import matplotlib.pyplot as plt
+from io import BytesIO
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+# Module-level session to enable connection reuse and avoid FD leaks
+HTTP_SESSION = requests.Session()
+try:
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=3)
+    HTTP_SESSION.mount('http://', adapter)
+    HTTP_SESSION.mount('https://', adapter)
+except Exception:
+    pass
 
 # ================= 配置区域 =================
 EVENT_RANGE = range(200, 300) 
@@ -20,7 +31,9 @@ def fetch_event_meta(event_id):
     """获取活动元数据"""
     try:
         meta_url = f"{BASE_URL}events/{event_id}.json"
-        metadata = requests.get(meta_url, timeout=5).json()
+        r = HTTP_SESSION.get(meta_url, timeout=5)
+        r.raise_for_status()
+        metadata = r.json()
         return {
             "event_id": event_id,
             "start_at": int(metadata["startAt"][SERVER]),
@@ -34,7 +47,9 @@ def fetch_tier_1000_data(event_id):
     """获取 T1000 分数线数据 (Tracker API)"""
     tracker_url = f"{BASE_URL}tracker/data?server={SERVER}&event={event_id}&tier=1000"
     try:
-        tracker_data = requests.get(tracker_url, timeout=10).json()
+        r = HTTP_SESSION.get(tracker_url, timeout=10)
+        r.raise_for_status()
+        tracker_data = r.json()
         if not tracker_data["result"]:
             return None
         return pd.DataFrame(tracker_data["cutoffs"])
@@ -50,7 +65,9 @@ def fetch_top10_max_speed(event_id):
     url = f"{BASE_URL}eventtop/data?server={SERVER}&event={event_id}&mid=0&interval=3600000"
     
     try:
-        data = requests.get(url, timeout=10).json()
+        r = HTTP_SESSION.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
         if not data or "points" not in data:
             return None
         
@@ -219,10 +236,6 @@ def main():
     # 生成可视化输出（如果 matplotlib 可用）
     try:
         def plot_distribution(dist, out_prefix="distribution"):
-            if plt is None:
-                print("matplotlib not available; skipping plotting")
-                return
-
             hours = list(range(24))
 
             def extract_stats(dtype):
@@ -244,7 +257,8 @@ def main():
             for dtype in ["weekday", "weekend"]:
                 medians, means, counts = extract_stats(dtype)
 
-                fig, ax1 = plt.subplots(figsize=(10, 4))
+                fig = Figure(figsize=(10, 4))
+                ax1 = fig.add_subplot(1, 1, 1)
                 ax1.plot(hours, medians, marker='o', label='median')
                 ax1.plot(hours, means, marker='x', label='mean', alpha=0.7)
                 ax1.set_xlabel('Hour')
@@ -262,9 +276,28 @@ def main():
                 out_dir = os.path.dirname(OUTPUT_FILE) or '.'
                 os.makedirs(out_dir, exist_ok=True)
                 out_path = os.path.join(out_dir, f"{out_prefix}_{dtype}.png")
-                fig.tight_layout()
-                fig.savefig(out_path)
-                plt.close(fig)
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+                # Prefer fig.savefig; if that fails in headless env, fallback to Agg canvas
+                try:
+                    fig.savefig(out_path)
+                except Exception:
+                    try:
+                        buf = BytesIO()
+                        FigureCanvasAgg(fig).print_png(buf)
+                        with open(out_path, 'wb') as f:
+                            f.write(buf.getvalue())
+                        buf.close()
+                    except Exception as e:
+                        print(f"Failed to save plot {out_path}: {e}")
+                finally:
+                    try:
+                        fig.clf()
+                        del fig
+                    except Exception:
+                        pass
                 print(f"Saved plot: {out_path}")
 
         plot_distribution(final_distribution, out_prefix=os.path.splitext(OUTPUT_FILE)[0])
