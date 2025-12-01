@@ -6,6 +6,7 @@ import os
 import time
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+import matplotlib.dates as mdates
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from scipy.optimize import curve_fit
@@ -542,6 +543,49 @@ class DataHandler:
         print(f"获取目标活动 {self.target_event_id} 数据...")
         df = fetch_tier_1000_data(self.target_event_id)
         if df is None or df.empty: raise ValueError("T1000 数据为空")
+        
+        # 自动修正 start_ts 以跳过维护期
+        # 1. 找到第一个 value > 0 的数据点（或者直接取第一个点，视数据源而定，通常 T1000 数据开始就是有分数的）
+        # 2. 将 start_ts 修正为该数据点时间的前一个整点
+        # 例如：实际第一个数据在 15:10，start_ts 修正为 15:00
+        
+        original_start_ts = self.meta['start_at']
+        
+        # 确保按时间排序
+        df = df.sort_values('time')
+        
+        # 找到第一个有效数据点的时间戳
+        first_valid_ts = None
+        if 'value' in df.columns:
+             # 过滤掉分数为 0 的点（如果有的话）
+             valid_points = df[df['value'] > 0]
+             if not valid_points.empty:
+                 first_valid_ts = valid_points.iloc[0]['time']
+        
+        # 如果没找到（或者全为0），就用原来的
+        if first_valid_ts is None:
+            first_valid_ts = df.iloc[0]['time']
+
+        # 计算修正后的 start_ts
+        # 逻辑：将 first_valid_ts 转换为 datetime，向下取整到小时，再转回 timestamp
+        dt_first = datetime.fromtimestamp(first_valid_ts / 1000, timezone.utc)
+        # 向下取整到最近的整点
+        dt_start_corrected = dt_first.replace(minute=0, second=0, microsecond=0)
+        corrected_start_ts = int(dt_start_corrected.timestamp() * 1000)
+
+        # 只有当修正后的时间比原始时间晚（说明确实有延迟/维护）时才应用，且不能晚太多（比如超过24小时就不对劲了）
+        if corrected_start_ts > original_start_ts and (corrected_start_ts - original_start_ts) < 24 * 3600 * 1000:
+            diff_hours = (corrected_start_ts - original_start_ts) / 3600000
+            print(f"检测到维护延迟，修正活动开始时间: +{diff_hours:.1f}h")
+            print(f"  原定: {datetime.fromtimestamp(original_start_ts/1000)}")
+            print(f"  修正: {datetime.fromtimestamp(corrected_start_ts/1000)}")
+            
+            # 更新 meta 中的 start_at，这样后续所有计算都会基于这个新起点
+            self.meta['start_at'] = corrected_start_ts
+            start_ts = corrected_start_ts
+        else:
+            start_ts = original_start_ts
+
         # 保留未受 debug_hours 限制的完整原始数据，用于绘图真实历史值
         raw_full_df = df.copy()
         
@@ -556,14 +600,11 @@ class DataHandler:
         df = calculate_speed_tracker(df)
         df["norm_speed"] = df["speed"] / self.target_scale
         
-        start_ts = self.meta['start_at']
+        # 使用（可能修正过的）start_ts 计算 hours_elapsed
         df["hours_elapsed"] = (df["time"] - start_ts) / (1000 * 3600)
         
         self.target_data = df
-        # If debug_hours wasn't provided by the caller, auto-detect current progress
-        # from the loaded data: set debug_hours to the latest observed hours and
-        # debug_limit_ts to the timestamp of the latest observation. This lets
-        # downstream code run without the user having to pass debug_hours.
+        
         if self.debug_hours is None:
             try:
                 if len(df) > 0:
@@ -575,7 +616,7 @@ class DataHandler:
                     print(f"进度自动检测: 已观测 {self.debug_hours:.2f} 小时")
             except Exception:
                 pass
-        # 处理并保存完整未截断的数据供绘图使用（保留原始完整历史）
+        
         try:
             full_df = raw_full_df.copy()
             full_df = calculate_speed_tracker(full_df)
@@ -583,8 +624,8 @@ class DataHandler:
             full_df["hours_elapsed"] = (full_df["time"] - start_ts) / (1000 * 3600)
             self.full_target_data = full_df
         except Exception:
-            # 失败时回退到已截断的数据，保证不抛异常
             self.full_target_data = df.copy()
+            
         return df
 
     def _process_single_candidate(self, curr):
@@ -1222,14 +1263,8 @@ class DataHandler:
 
     def plot_final(self, target_df, t_pred, y_skeleton, y_final, t_score, y_score, output_path=None, return_type=None):
         """
-        Draw prediction plots and save to `output_path` if provided.
-
-        Parameters:
-        - target_df: DataFrame of observed points (with 'hours_elapsed', 'norm_speed', 'skeleton_speed')
-        - t_pred, y_skeleton: arrays for predicted skeleton curve
-        - y_final: adjusted predicted normalized speed curve (post-scale and smoothing)
-        - t_score, y_score: arrays for combined historical+predicted cumulative score timeline
-        - output_path: if provided, save figure to this path; otherwise call plt.show().
+        Draw prediction plots with Real Date-Time X-axis (Fixed for Timezone Alignment).
+        Forces all timestamps to be naive local time to prevent matplotlib auto-conversion issues.
         """
         # ensure output directory exists when saving
         if output_path:
@@ -1240,40 +1275,80 @@ class DataHandler:
                 except Exception as e:
                     logger.warning(f"Failed to create output directory {out_dir}: {e}")
 
-        # Use object-oriented Figure to avoid pyplot global state (safer for servers)
+        # 1. 准备时间转换基准 (Base Timestamp)
+        start_ts = self.meta['start_at']
+        tz_offset = self.seasonality.tz_offset
+        
+        # 先转成 UTC aware，加上偏移量变成当地时间，然后立刻 replace(tzinfo=None) 剥离时区标签。
+        # 这样得到的是一个“看起来是当地时间，但没有任何时区包袱”的纯净时间对象。
+        # 例如：原本是 UTC 12:00 (aware)，+8h -> Local 20:00 (aware) -> strip -> Local 20:00 (naive)
+        start_dt_utc = datetime.fromtimestamp(start_ts / 1000, timezone.utc)
+        start_dt_local = (start_dt_utc + timedelta(hours=tz_offset)).replace(tzinfo=None)
+
+        # 2. 辅助函数：将相对小时数数组转换为 naive local datetime 数组
+        def to_real_time(hours_array):
+            deltas = pd.to_timedelta(hours_array, unit='h')
+            return start_dt_local + deltas
+
+        # 3. 转换各个数据源的时间轴
+        # A. 观测数据 (target_df)
+        # pd.to_datetime(unit='ms') 默认生成 naive UTC。
+        # 我们直接加上 Timedelta(hours=offset)，让它在数值上变成当地时间，且保持 naive 状态。
+        if 'time' in target_df.columns:
+            obs_time = pd.to_datetime(target_df['time'], unit='ms') + pd.Timedelta(hours=tz_offset)
+        else:
+            obs_time = to_real_time(target_df['hours_elapsed'].values)
+        
+        # B. 预测数据 (numpy arrays) -> 这里的基准已经是 start_dt_local (naive) 了
+        t_pred_dt = to_real_time(t_pred)
+        t_score_dt = to_real_time(t_score)
+        
+        # C. 当前 Debug 时间点
+        debug_dt = start_dt_local + timedelta(hours=self.debug_hours)
+
+        # Use object-oriented Figure
         fig = Figure(figsize=(12, 10))
         ax1 = fig.add_subplot(2, 1, 1)
         ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
         
+        # --- 设置日期格式化器 ---
+        date_fmt = mdates.DateFormatter('%m-%d %H:%M')
+        date_loc = mdates.AutoDateLocator()
+
         # --- 子图1: 速度曲线 ---
-        ax1.scatter(target_df['hours_elapsed'], target_df['skeleton_speed'], 
+        ax1.scatter(obs_time, target_df['skeleton_speed'], 
                     s=10, color='gray', alpha=0.3, label='Observed Skeleton')
-        ax1.plot(t_pred, y_skeleton, color='blue', linestyle='--', alpha=0.5, label='Predicted Skeleton (Sine - Concave)')
+        ax1.plot(t_pred_dt, y_skeleton, color='blue', linestyle='--', alpha=0.5, label='Predicted Skeleton')
         
-        ax1.plot(target_df['hours_elapsed'], target_df['norm_speed'], 
+        ax1.plot(obs_time, target_df['norm_speed'], 
                  color='red', linewidth=2, label='Observed Speed')
-        ax1.plot(t_pred, y_final, color='green', linewidth=2, alpha=0.8, label='Predicted Speed')
-        # 如果存在完整的未截断数据，绘制真实的“未来”速度以便对比
+        ax1.plot(t_pred_dt, y_final, color='green', linewidth=2, alpha=0.8, label='Predicted Speed')
+
+        # 绘制真实的“未来”速度 (如果有 full_target_data)
         try:
             if hasattr(self, 'full_target_data') and hasattr(self, 'target_data'):
-                obs_end = float(self.target_data['hours_elapsed'].max()) if len(self.target_data) > 0 else 0
+                obs_end_hours = float(self.target_data['hours_elapsed'].max()) if len(self.target_data) > 0 else 0
                 full_df = self.full_target_data
-                mask_future_real = full_df['hours_elapsed'].values > obs_end
+                mask_future_real = full_df['hours_elapsed'].values > obs_end_hours
                 if np.any(mask_future_real):
-                    ax1.plot(full_df['hours_elapsed'].values[mask_future_real],
+                    future_real_hours = full_df['hours_elapsed'].values[mask_future_real]
+                    future_real_time = to_real_time(future_real_hours)
+                    ax1.plot(future_real_time,
                              full_df['norm_speed'].values[mask_future_real],
                              color='orange', linestyle='-.', linewidth=2, alpha=0.9, label='Actual Future Speed')
         except Exception:
             pass
 
-        ax1.axvline(x=self.debug_hours, color='black', linestyle=':', label='Now')
+        ax1.axvline(x=debug_dt, color='black', linestyle=':', label='Now')
         ax1.set_ylabel("Normalized Speed")
-        ax1.set_title(f"Event {self.target_event_id} Speed Prediction")
+        ax1.set_title(f"Event {self.target_event_id} Speed Prediction (Local Time, UTC+{tz_offset})")
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
         
+        ax1.xaxis.set_major_formatter(date_fmt)
+        ax1.xaxis.set_major_locator(date_loc)
+
         # --- 子图2: 累计分数曲线 ---
-        # 绘制历史累计分数：使用完整未截断的 `self.full_target_data`（若存在），否则退回到 `self.target_data`
         hist_df = getattr(self, 'full_target_data', self.target_data)
         if 'ep' in hist_df.columns:
             hist_score = hist_df['ep'].values
@@ -1282,64 +1357,69 @@ class DataHandler:
         else:
             hist_score = np.zeros(len(hist_df))
 
-        hist_hours = hist_df['hours_elapsed'].values
-        ax2.plot(hist_hours, hist_score, color='red', linewidth=2, label='Observed Score')
+        # 历史数据时间轴转换 (同样确保 naive)
+        if 'time' in hist_df.columns:
+            hist_time_dt = pd.to_datetime(hist_df['time'], unit='ms') + pd.Timedelta(hours=tz_offset)
+        else:
+            hist_time_dt = to_real_time(hist_df['hours_elapsed'].values)
 
-        # 标注真实最终观测值（最后一个历史点）
+        ax2.plot(hist_time_dt, hist_score, color='red', linewidth=2, label='Observed Score')
+
         try:
-            if len(hist_hours) > 0:
-                obs_final_time = float(hist_hours[-1])
+            if len(hist_time_dt) > 0:
+                # 处理 Series 或 ndarray 的取值
+                obs_final_t = hist_time_dt.iloc[-1] if hasattr(hist_time_dt, 'iloc') else hist_time_dt[-1]
                 obs_final_val = float(hist_score[-1])
-                ax2.scatter(obs_final_time, obs_final_val, color='darkred', s=50, zorder=5, label='Observed Final')
-                ax2.text(obs_final_time, obs_final_val, f"Observed: {int(obs_final_val):,}",
+                ax2.scatter(obs_final_t, obs_final_val, color='darkred', s=50, zorder=5, label='Observed Final')
+                ax2.text(obs_final_t, obs_final_val, f"Obs: {int(obs_final_val):,}",
                          ha='left', va='bottom', fontsize=10, color='darkred')
         except Exception:
             pass
 
-        # 只画预测的未来部分，避免与历史重叠
-        # 使用被截断的观测数据（self.target_data）的最后时刻作为“现在”的分界点，
-        # 否则 full_target_data 可能包含更晚的历史值导致没有未来段被绘制。
         if hasattr(self, 'target_data') and len(self.target_data) > 0:
-            obs_end = float(self.target_data['hours_elapsed'].max())
+            obs_end_hours = float(self.target_data['hours_elapsed'].max())
         else:
-            obs_end = hist_hours.max() if len(hist_hours) > 0 else 0
-        pred_mask = np.array(t_score) > obs_end
+            obs_end_hours = 0
+        
+        pred_mask = np.array(t_score) > obs_end_hours
+        
         if np.any(pred_mask):
-            t_pred_only = np.array(t_score)[pred_mask]
+            t_pred_only_dt = np.array(t_score_dt)[pred_mask]
             y_pred_only = np.array(y_score)[pred_mask]
-            ax2.plot(t_pred_only, y_pred_only, color='purple', linestyle='--', linewidth=2, label='Predicted Future')
+            ax2.plot(t_pred_only_dt, y_pred_only, color='purple', linestyle='--', linewidth=2, label='Predicted Future')
+            
             final_score = y_pred_only[-1]
-            ax2.text(t_pred_only[-1], final_score, f"{int(final_score):,}", 
+            final_time = t_pred_only_dt[-1]
+            ax2.text(final_time, final_score, f"{int(final_score):,}", 
                      ha='right', va='bottom', fontsize=12, fontweight='bold', color='purple')
         else:
-            # 如果没有未来点，则使用最后一个点作为最终值展示
             final_score = float(hist_score[-1]) if len(hist_score) > 0 else 0.0
 
-        ax2.axvline(x=self.debug_hours, color='black', linestyle=':')
+        ax2.axvline(x=debug_dt, color='black', linestyle=':')
         ax2.set_ylabel("Cumulative Event Points")
-        ax2.set_xlabel("Hours Elapsed")
+        ax2.set_xlabel(f"Date Time (Local)")
         ax2.set_title(f"Final Prediction: {int(final_score):,} PT")
         ax2.legend(loc='lower right')
         ax2.grid(True, alpha=0.3)
         
-        # use Figure.tight_layout to avoid pyplot
+        ax2.xaxis.set_major_formatter(date_fmt)
+        ax2.xaxis.set_major_locator(date_loc)
+        
+        fig.autofmt_xdate()
+
         try:
             fig.tight_layout()
         except Exception:
             pass
 
-        # --- 添加水印 (适用于 fig/bytes/path 三种返回方式) ---
         try:
             wm_text = "@byydzh mycx 1000"
-            # 使用 Figure coordinates (0..1), 右下角放置，半透明以免遮挡
             fig.text(0.99, 0.01, wm_text, fontsize=10, color='gray', alpha=0.6,
                      ha='right', va='bottom', zorder=100)
         except Exception as e:
             logger.debug(f"Failed to draw watermark: {e}")
 
-        # Return behavior for integration (Streamlit etc.)
         if return_type == 'fig':
-            # Return the Figure object for caller to render; do not close here
             return fig
 
         if return_type == 'bytes':
@@ -1349,7 +1429,6 @@ class DataHandler:
                 buf.seek(0)
                 img_bytes = buf.getvalue()
                 buf.close()
-                # clean up
                 try:
                     fig.clf()
                     del fig
@@ -1365,7 +1444,6 @@ class DataHandler:
                     pass
                 return None
 
-        # default / 'path' behavior: save to disk if output_path provided, else show
         if output_path:
             try:
                 fig.savefig(output_path, dpi=150)
@@ -1373,7 +1451,6 @@ class DataHandler:
                 logger.info(f"Saved prediction plot to {output_path}")
             except Exception as e:
                 logger.warning(f"Failed to save plot to {output_path}: {e}")
-                # render to buffer as fallback (headless-safe)
                 try:
                     buf = BytesIO()
                     FigureCanvasAgg(fig).print_png(buf)
@@ -1381,7 +1458,6 @@ class DataHandler:
                 except Exception:
                     pass
         else:
-            # headless environment: render to buffer and discard (no interactive show)
             try:
                 buf = BytesIO()
                 FigureCanvasAgg(fig).print_png(buf)
@@ -1390,13 +1466,11 @@ class DataHandler:
                 pass
 
         print(f"最终预测分数: {int(final_score):,} PT")
-        # close/clear the figure to free memory
         try:
             fig.clf()
             del fig
         except Exception:
             pass
-        # when saved to path, return output_path
         if output_path:
             return output_path
         return None
