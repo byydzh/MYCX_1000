@@ -124,13 +124,13 @@ class Visualizer:
         # 3. 真实最终分 (Actual) - 仅在回测且有值时显示
         if real_final_score > 0:
             # # 为了防止和预测分重叠，如果两者接近，稍微错开一点位置
-            # offset_y = 0
-            # if abs(real_final_score - final_s) < (final_s * 0.15):
-            #     offset_y = + (final_s * 0.1) # 向上挪一点
+            offset_y = real_final_score
+            if abs(real_final_score - final_s) < (final_s * 0.15):
+                offset_y = min(0.8 * real_final_score, final_s * 0.85)  # 向下挪一点
             
             # 计算真实结束时间
             real_final_t = self._to_real_time([target.meta.total_hours], start_ts)[0]
-            ax2.text(real_final_t, real_final_score / 2, f"\nAct: {int(real_final_score):,}", 
+            ax2.text(real_final_t, offset_y, f"\nAct: {int(real_final_score):,}", 
                      ha='right', va='top', fontsize=11, fontweight='bold', color='darkred')
 
         ax2.axvline(x=now_dt, color='black', linestyle=':')

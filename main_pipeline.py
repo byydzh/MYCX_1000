@@ -148,3 +148,4 @@ if __name__ == "__main__":
     pipeline = PredictionPipeline()
     # 示例用法
     pipeline.run()
+    # pipeline.run(target_event_id=289, debug_hours=80)

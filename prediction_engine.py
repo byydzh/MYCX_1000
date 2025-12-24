@@ -344,6 +344,31 @@ class PredictionEngine:
         # 3. 获取并修正参数
         avg_params = self._fit_history_params(history)
         pred_params = avg_params.copy()
+        
+        # === 时长归一化修正 (Time-Scale Normalization) ===
+        # 计算历史活动的平均时长
+        hist_durations = [h.meta.total_hours for h in history if h.meta.total_hours > 0]
+        avg_hist_duration = np.mean(hist_durations) if hist_durations else 192.0 # 默认8天
+        target_duration = target.meta.total_hours
+        
+        # 计算时长倍率 (Scale Length)
+        # 如果当前活动比历史长，len_ratio > 1.0
+        len_ratio = target_duration / avg_hist_duration if avg_hist_duration > 0 else 1.0
+        
+        # if len_ratio > 1.1 or len_ratio < 0.9:
+        if len_ratio > 1.15:
+            logger.info(f"检测到时长差异 (Target: {target_duration:.1f}h vs Hist: {avg_hist_duration:.1f}h), "
+                        f"应用参数稀释: ratio={len_ratio:.2f}")
+            
+            # 修正线性项 A: V ~ A*t -> 为了保持 V 不变，A 需除以 len_ratio
+            pred_params[1] /= len_ratio
+            
+            # 修正二次项 B: V ~ B*t^2 -> 为了保持 V 不变，B 需除以 len_ratio^2
+            pred_params[2] /= (len_ratio ** 2.0)
+            
+            # 恐慌点 B_end 通常与时长关系不大
+        # =======================================================
+
         pred_params[0] *= ratio        # Base
         pred_params[1] *= ratio        # A
         pred_params[2] *= ratio        # B
