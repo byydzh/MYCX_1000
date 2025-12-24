@@ -1,8 +1,14 @@
+# README.md
+
 点击以→ **[Launch Dashboard (启动预测面板)](https://mycx1000.streamlit.app)**
 
-AI总结模型，不保证正确，仍存在明显缺陷，有空再改：
+---
 
-这其实是一个**“基于历史参数拟合的混合动力学模型”**。它不是单纯的时间序列回归（如 ARIMA），而是基于**先验形状（Prior Shape）** + **实时修正（Real-time Correction）** 的物理建模思路。
+下面是AI对模型的总结，不保证描述正确；预测仍存在明显缺陷，有空再改：
+
+---
+
+这其实是一个 **“基于历史参数拟合的混合动力学模型”** 。它不是单纯的时间序列回归（如 ARIMA），而是基于**先验形状（Prior Shape** + **实时修正（Real-time Correction）** 的物理建模思路。
 
 以下是本喵为您整理的数学公式抽象：
 
@@ -71,14 +77,19 @@ $$
 
 这意味着如果当前活动比历史热 1.2 倍，那么基础速度参数 ($A, B$) 也会放大 1.2 倍，但末期冲刺 ($B_{end}$) 会放大 $1.2^{1.1}$ 倍（越热的活动最后越卷）。
 
-#### B. 积分对齐 (Scale Factor)
-仅仅形状对还不够，必须保证“预测速度的积分”等于“实际分数的增量”。
+#### B. 动态缩放 (Kalman Filter Scale)
+为了捕捉实时的热度变化，模型使用 **卡尔曼滤波 (Kalman Filter)** 实时估计当前的缩放系数 $\text{Scale}(t)$ 和趋势 $\text{Trend}(t)$。
+状态向量 $x = [\text{Scale}, \text{Trend}]^T$，观测值为实际分数增量与模型预测增量的比值。
+
+#### C. 恐慌期阻尼 (Panic Damping)
+在活动末期（Panic Phase），为了防止 $\text{Scale}$ 系数与 $B_{end}$ 及 $\text{PanicBoost}$ 发生乘数效应叠加导致预测失真，引入了阻尼机制。
+随着时间接近结束，强行将 $\text{Scale}$ 回归到 1.0，即**在最后时刻完全信任模型的形状参数，而非实时的波动系数**。
+
+设 $\lambda(t)$ 为进入恐慌期的进度（0.0 $\to$ 1.0）：
 
 $$
-\text{Scale} = \frac{\Delta \text{Score}_{observed}}{\int_{t_{cutoff}}^{t_{now}} (V_{pred}(t) \cdot \text{T100Speed}) \, dt}
+\text{Scale}_{final}(t) = \text{Scale}_{KF}(t) \cdot (1 - \lambda(t)^2) + 1.0 \cdot \lambda(t)^2
 $$
-
-此外，代码中包含了一个 **24h Backtest** 机制：如果活动过半，会额外检查过去 24 小时的拟合情况来微调 $\text{Scale}$。
 
 ---
 
@@ -106,20 +117,5 @@ $$
 最终的分数预测 $P(t)$ 是速度的积分：
 
 $$
-P(t_{future}) = P(t_{now}) + \int_{t_{now}}^{t_{future}} f_{smooth}\left( V_{pred}(\tau) \cdot \text{Scale} \right) \cdot \text{T10Scale} \, d\tau
+P(t_{future}) = P(t_{now}) + \int_{t_{now}}^{t_{future}} f_{smooth}\left( V_{pred}(\tau) \cdot \text{Scale}_{final}(\tau) \right) \cdot \text{T10Scale} \, d\tau
 $$
-
----
-
-### 优化建议 (Future Works)
-
-目前的模型已经很完善了，但如果您想进一步优化，可以考虑这几个方向喵：
-
-1.  **卡池/活动类型特征化 (Feature Engineering)：**
-    目前 `Ratio` 只是简单地比较前几小时的速度。可以引入一个“卡池热度系数”或者“活动类型系数”作为先验 $Prior$。比如 `Roselia` 的活动天生 $Ratio \times 1.2$。
-
-2.  **贝叶斯更新 (Bayesian Update)：**
-    目前的 `Scale` 是硬计算的。可以使用卡尔曼滤波 (Kalman Filter) 或者贝叶斯推断，随着时间推移，逐渐减小 `History` 的权重，增加 `Observation` 的权重，这样在活动中期会更稳。
-
-3.  **末期冲刺的动态调整：**
-    目前的 `PanicBoost` 是固定的公式。实际上，如果最后一天是周末，Panic 程度会比工作日更剧烈。可以将 `Seasonality` 和 `Panic` 耦合得更紧密一些。

@@ -18,7 +18,7 @@ class PredictionEngine:
     2. 执行去节律化 (De-seasonality)。
     3. 计算对比系数 (Ratio)。
     4. 执行拟合与预测 (Fitting & Prediction)。
-    5. 应用修正逻辑 (Backtest Correction & Smoothing)。
+    5. 应用修正逻辑 (Kalman Filter Correction & Smoothing)。
     """
     def __init__(self, seasonality_handler, modeler, config: dict = None):
         self.seasonality = seasonality_handler
@@ -124,124 +124,182 @@ class PredictionEngine:
             return np.array([0.05, 0.001, 0.0, 0.5, 24.0])
         return np.mean(hist_params, axis=0)
 
+    def _run_kalman_filter(self, times: np.ndarray, obs_scores: np.ndarray, 
+                           model_speed_func, dt_step=1.0) -> Tuple[float, float]:
+        # print(f"\n{'='*20} START KALMAN FILTER DEBUG {'='*20}")
+        # print(f"{'Time':<6} | {'ObsDelta':<8} | {'ModDelta':<8} | {'Raw_Z':<8} | {'Z_clip':<6} | {'K_gain':<6} | {'Scale':<6} | {'Trend':<8}")
+        # print("-" * 90)
+
+        # --- 1. 初始化状态 ---
+        # State x = [scale, trend]^T
+        x = np.array([[1.0], [0.0]])
+        
+        # 状态协方差 P (初始不确定性)
+        P = np.array([[0.5, 0], [0, 0.01]])
+        
+        # 状态转移矩阵 F
+        F = np.array([[1.0, dt_step], [0.0, 1.0]])
+        
+        # 过程噪声 Q
+        Q = np.array([[1e-5, 0], [0, 1e-7]]) 
+        
+        # 测量矩阵 H
+        H = np.array([[1.0, 0.0]])
+        
+        # --- 2. 准备观测数据 ---
+        t_start = times[0]
+        t_end = times[-1]
+        current_t = t_start
+        
+        while current_t + dt_step <= t_end:
+            t1 = current_t
+            t2 = current_t + dt_step
+            
+            # --- A. 预测步骤 (Predict) ---
+            x_pred = F @ x
+            P_pred = F @ P @ F.T + Q
+            
+            # --- B. 构建观测 (Measurement) ---
+            # 1. 计算实际增量
+            score_t1 = np.interp(t1, times, obs_scores)
+            score_t2 = np.interp(t2, times, obs_scores)
+            delta_obs = score_t2 - score_t1
+            
+            # 2. 计算模型增量
+            mid_t = (t1 + t2) / 2.0
+            model_speed = model_speed_func(mid_t)
+            delta_model = model_speed * dt_step
+            
+            # --- C. 更新步骤 (Update) ---
+            # 只有当模型预测有显著增量时，观测才有效
+            if delta_model > 50.0: 
+                raw_z = delta_obs / delta_model
+                
+                # 观测值硬截断
+                z_val = np.clip(raw_z, 0.1, 5.0)
+                z = np.array([[z_val]])
+                
+                # 动态调整测量噪声 R
+                penalty = 0.0
+                if abs(raw_z - z_val) > 0.1:
+                    penalty = 100.0 
+                
+                base_R = 0.1
+                adaptive_R = base_R + (2000.0 / (delta_model + 1.0)) * 0.01 + penalty
+                R = np.array([[adaptive_R]])
+                
+                # 卡尔曼增益 K
+                S = H @ P_pred @ H.T + R
+                K = P_pred @ H.T @ np.linalg.inv(S)
+                
+                # 更新状态
+                y = z - (H @ x_pred) # 残差
+                x = x_pred + K @ y
+                P = (np.eye(2) - K @ H) @ P_pred
+
+                # === DEBUG PRINT ===
+                # 重点观察 Raw_Z 是否因为 delta_model 太小而变得巨大
+                # print(f"{current_t:<6.1f} | {delta_obs:<8.1f} | {delta_model:<8.1f} | {raw_z:<8.3f} | {z_val:<6.2f} | {K[0,0]:<6.3f} | {x[0,0]:<6.3f} | {x[1,0]:<8.5f}")
+
+            else:
+                # 如果跳过了更新，也打印一下，看看是不是因为 delta_model 太小
+                x = x_pred
+                P = P_pred
+                # print(f"{current_t:<6.1f} | {delta_obs:<8.1f} | {delta_model:<8.1f} | {'SKIP':<8} | {'-'*6} | {'-'*6} | {x[0,0]:<6.3f} | {x[1,0]:<8.5f} <--- Skipped (Model too small)")
+            
+            current_t += dt_step
+            
+        # print(f"{'='*20} END DEBUG {'='*20}\n")
+        return float(x[0, 0]), float(x[1, 0])
+
     def _calculate_scale_factor(self, target: EventData, future_t: np.ndarray, 
-                                speed_pred_norm: np.ndarray) -> float:
+                                speed_pred_norm: np.ndarray) -> Tuple[float, np.ndarray]:
         """
-        [核心逻辑] 计算缩放系数 (Scale Factor)。
-        通过对比“模型预测的积分”和“实际观测的积分增量”来校准。
-        包含：
-        1. Cutoff Alignment: 对齐首日18:00到现在的积分。
-        2. 24h Backtest: 如果进度过半，额外回测过去24小时的吻合度。
+        使用卡尔曼滤波计算 Scale Factor。
+        返回: (Applied_Scale_Factor, Dynamic_Adjustment_Array)
         """
         try:
-            # 准备基础变量
-            real_speed_all = speed_pred_norm * target.scale
-            dt_hours = (future_t[1] - future_t[0]) if len(future_t) > 1 else 0.0
-            dt_min = dt_hours * 60.0
-            cum_model = np.cumsum(real_speed_all * dt_min) # 模型的累积积分曲线
-
-            current_max_time = target.df['hours_elapsed'].max()
-            current_max_score = target.df['value'].max()
-
-            # --- 步骤 1: 确定 Cutoff 时间 (首日 18:00) ---
-            # 目的：跳过开服前几小时的不稳定期，从稳定的 18:00 开始计算积分
+            # 1. 确定 Cutoff 时间 (首日 18:00)
+            # 目的：跳过开服前几小时的不稳定期
             start_ts = target.meta.start_at
             tz_offset = self.seasonality.tz_offset
-            
-            # 构造带时区的 datetime
             start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone(timedelta(hours=tz_offset)))
             cutoff_dt = start_dt.replace(hour=18, minute=0, second=0, microsecond=0)
             cutoff_ts = int(cutoff_dt.timestamp() * 1000)
+            cutoff_hours = max(0.0, (cutoff_ts - start_ts) / 3600000.0)
             
-            # 转为相对小时数
-            cutoff_hours = (cutoff_ts - start_ts) / 3600000.0
-            if cutoff_hours < 0.0: cutoff_hours = 0.0
-
-            # --- 步骤 2: 计算 Model Since Cutoff ---
-            # 在 future_t 中找到 cutoff 和 now 的索引
-            idx_cutoff = int(np.searchsorted(future_t, cutoff_hours, side='left'))
-            idx_now = int(np.searchsorted(future_t, current_max_time, side='right') - 1)
+            current_max_time = target.df['hours_elapsed'].max()
             
-            # 索引边界保护
-            idx_cutoff = max(0, min(idx_cutoff, len(cum_model) - 1))
-            idx_now = max(0, min(idx_now, len(cum_model) - 1))
+            # 如果数据太少（还没到 cutoff），直接返回默认值
+            if current_max_time < cutoff_hours + 1.0:
+                return 1.0, np.ones_like(future_t)
 
-            # 模型在 [Cutoff, Now] 期间产生的积分增量
-            model_val_cutoff = cum_model[idx_cutoff-1] if idx_cutoff > 0 else 0.0
-            model_since_cutoff = float(cum_model[idx_now] - model_val_cutoff)
-
-            # --- 步骤 3: 计算 Observed Since Cutoff ---
-            # 找到实际数据中 Cutoff 时刻的分数
-            observed_before_cutoff = 0.0
+            # 2. 准备数据给 KF
+            # 截取 Cutoff 之后的数据
+            mask = target.df['hours_elapsed'] >= cutoff_hours
+            if mask.sum() < 2: return 1.0, np.ones_like(future_t)
             
-            # 使用 hours_elapsed 查找比 cutoff_hours 小的最后一个点
-            hrs = target.df['hours_elapsed'].values
-            scores = target.df['value'].values
-            before_mask = hrs < cutoff_hours
+            kf_times = target.df.loc[mask, 'hours_elapsed'].values
+            kf_scores = target.df.loc[mask, 'value'].values
             
-            if np.any(before_mask):
-                observed_before_cutoff = float(scores[np.where(before_mask)[0][-1]])
-            else:
-                observed_before_cutoff = float(scores[0]) if len(scores) > 0 else 0.0
+            # 构造一个快速查询模型速度的函数
+            # speed_pred_norm 对应 future_t
+            def get_model_speed(t):
+                # 这里的 speed 是 normalized speed，需要乘 target.scale 才是 pt/hour
+                norm_spd = np.interp(t, future_t, speed_pred_norm)
+                return norm_spd * target.scale * 60.0 
 
-            observed_since_cutoff = float(current_max_score) - observed_before_cutoff
-
-            # --- 步骤 4: 初步 Scale 计算 ---
-            if model_since_cutoff > 0 and observed_since_cutoff >= 0:
-                raw_scale = observed_since_cutoff / model_since_cutoff
-            else:
-                raw_scale = 1.0
-
-            # 截断
-            SCALE_MIN = float(self.config.get('scale_min', 0.5))
-            SCALE_MAX = float(self.config.get('scale_max', 2.0))
-            scale_factor = float(np.clip(raw_scale, SCALE_MIN, SCALE_MAX))
+            # 3. 运行 KF
+            est_scale, est_trend = self._run_kalman_filter(kf_times, kf_scores, get_model_speed, dt_step=1.0)
             
-            logger.info(f"Scale Diagnostics: ObsDelta={observed_since_cutoff:.0f}, ModDelta={model_since_cutoff:.0f}, Raw={raw_scale:.4f}, Clipped={scale_factor:.4f}")
-
-            # --- 步骤 5: 24h 回测修正 (Backtest Correction) ---
-            # 如果活动进行超过 50 小时，检查过去 24 小时的拟合情况
-            applied_scale_factor = scale_factor
+            logger.info(f"Kalman Filter Result: Scale={est_scale:.4f}, Trend={est_trend:.6f}/hr")
             
-            if current_max_time > 50.0:
-                t0 = max(0.0, current_max_time - 24.0)
+            # 4. 构造未来的 Scale 曲线
+            # 我们不希望 Trend 无限延伸，因此应用衰减
+            # Scale(t) = Scale_now + Trend_now * (1 - e^(-lambda * dt)) / lambda  (类似阻尼)
+            # 或者简单点：让 Trend 线性衰减到 0
+            
+            # 截断保护
+            est_scale = np.clip(est_scale, 0.5, 3.0)
+            # 限制 trend 的幅度，防止过拟合
+            est_trend = np.clip(est_trend, -0.05, 0.05) 
+            
+            # 构造 adjustment array
+            scale_curve = np.ones_like(future_t) * est_scale
+            
+            # 找到现在的索引
+            idx_now = np.searchsorted(future_t, current_max_time)
+            
+            # 对未来应用带阻尼的趋势
+            if idx_now < len(future_t):
+                future_deltas = future_t[idx_now:] - current_max_time
+                # 阻尼系数：每过 12 小时，趋势影响力减半
+                decay_lambda = np.log(2) / 12.0 
                 
-                # 定位索引
-                idx_t0 = int(np.searchsorted(future_t, t0, side='left'))
-                idx_now = int(np.searchsorted(future_t, current_max_time, side='right') - 1)
-                idx_t0 = max(0, min(idx_t0, len(future_t) - 1))
-                idx_now = max(0, min(idx_now, len(future_t) - 1))
-
-                if idx_now > idx_t0:
-                    # 模型在过去 24h 的增量 (应用了当前的 scale_factor)
-                    # 注意：这里我们手动积分这一段，因为 cum_model 是未缩放的
-                    pred_segment = speed_pred_norm[idx_t0:idx_now]
-                    model_24 = float(np.sum(pred_segment) * target.scale * scale_factor * dt_min)
-
-                    # 实际在过去 24h 的增量
-                    pos = int(np.searchsorted(hrs, t0, side='left'))
-                    observed_before_t0 = float(scores[pos-1]) if pos > 0 else float(scores[0])
-                    observed_24 = float(current_max_score) - observed_before_t0
-
-                    # 计算修正比率
-                    if model_24 > 0 and observed_24 >= 0:
-                        raw_corr = observed_24 / model_24
-                        CORR_MIN = float(self.config.get('corr_min', 0.6))
-                        CORR_MAX = float(self.config.get('corr_max', 1.6))
-                        corr = float(np.clip(raw_corr, CORR_MIN, CORR_MAX))
-                        
-                        applied_scale_factor = scale_factor * corr
-                        logger.info(f"24h Backtest: Obs24={observed_24:.0f}, Mod24={model_24:.0f}, Corr={corr:.4f} -> FinalScale={applied_scale_factor:.4f}")
-
-            return applied_scale_factor
+                # 积分形式的阻尼： Trend * (1 - exp(-lambda * t)) / lambda ???
+                # 不，Scale 是速度的系数。Trend 是 Scale 的变化率。
+                # Scale(t) = Scale_0 + \int Trend(t) dt
+                # 设 Trend(t) = Trend_0 * exp(-lambda * t)
+                # 则 Scale(t) = Scale_0 + Trend_0 * (1 - exp(-lambda * t)) / lambda
+                
+                trend_impact = est_trend * (1.0 - np.exp(-decay_lambda * future_deltas)) / decay_lambda
+                scale_curve[idx_now:] += trend_impact
+                
+            # 对过去的部分（仅用于绘图或对齐），简单设为 est_scale
+            # 实际计算积分时，过去的部分其实不重要，因为我们是基于 current_score 往后加
+            return float(est_scale), scale_curve
 
         except Exception as e:
-            logger.error(f"Error calculating scale factor: {e}")
-            return 1.0
+            logger.error(f"Error in Kalman Filter: {e}")
+            return 1.0, np.ones_like(future_t)
 
-    def _apply_smoothing(self, speed_pred_norm: np.ndarray, scale_factor: float) -> np.ndarray:
-        """应用高分段的平滑压制逻辑 (Top-speed Smoothing)。"""
-        norm_after_scale = speed_pred_norm * scale_factor
+    def _apply_smoothing(self, speed_pred_norm: np.ndarray, scale_curve: np.ndarray) -> np.ndarray:
+        """
+        应用高分段的平滑压制逻辑 (Top-speed Smoothing)。
+        现在 scale_curve 是一个数组。
+        """
+        # 逐点相乘
+        norm_after_scale = speed_pred_norm * scale_curve
         
         THRESH1 = float(self.config.get('smooth_thresh1', 0.5))
         THRESH2 = float(self.config.get('smooth_thresh2', 0.65))
@@ -302,11 +360,38 @@ class PredictionEngine:
             total_hours=total_hours, t_panic=pred_params[4]
         )
         
-        # 6. 计算 Scale Factor (积分对齐 + 24h回测)
-        scale_factor = self._calculate_scale_factor(target, future_t, speed_pred_norm)
+        # 6. 计算 Scale Factor (Kalman Filter)
+        base_scale, scale_curve = self._calculate_scale_factor(target, future_t, speed_pred_norm)
         
-        # 7. 应用平滑压制
-        final_speed_norm = self._apply_smoothing(speed_pred_norm, scale_factor)
+        # 限制 Scale 对 Panic Term 的过度影响。
+        # 在进入恐慌期（Panic Phase）后，逐渐让 Scale 回归 1.0，
+        # 从而让结尾的走势主要由 B_end 和 panic_scaler 等模型参数决定，防止乘数爆炸。
+        
+        t_panic_duration = float(pred_params[4]) # 获取拟合出的恐慌时长
+        if t_panic_duration > 0:
+            t_start_panic = total_hours - t_panic_duration
+            
+            # 1. 计算每个时间点进入恐慌期的进度 (0.0 ~ 1.0)
+            # 使用 clip 确保只在最后阶段生效
+            panic_progression = np.clip((future_t - t_start_panic) / t_panic_duration, 0.0, 1.0)
+            
+            # 2. 只有在真正进入恐慌期的时间点才生效
+            mask_active = future_t > t_start_panic
+            
+            # 3. 混合逻辑：
+            # 进度为 0 时（刚进恐慌期）：完全使用 scale_curve
+            # 进度为 1 时（活动结束）：完全使用 1.0 (完全信任模型参数)
+            # 这里使用平方插值 (prog^2) 让过渡更平滑，越接近结束，归一化力度越大
+            blend_weight = np.power(panic_progression, 2.0)
+            
+            # 应用阻尼
+            scale_curve[mask_active] = (
+                scale_curve[mask_active] * (1.0 - blend_weight[mask_active]) + 
+                1.0 * blend_weight[mask_active]
+            )
+        
+        # 7. 应用平滑压制 (传入曲线)
+        final_speed_norm = self._apply_smoothing(speed_pred_norm, scale_curve)
         
         # 8. 积分求分数
         real_speed_ep_min = final_speed_norm * target.scale
@@ -336,7 +421,7 @@ class PredictionEngine:
             final_score=final_score,
             used_params=pred_params,
             ratio=ratio,
-            scale_factor=scale_factor,
+            scale_factor=base_scale, # 这里只存一个基准值用于展示
             full_t_score=full_t_score,
             full_score=full_score
         )
