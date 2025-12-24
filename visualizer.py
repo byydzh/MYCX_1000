@@ -1,0 +1,165 @@
+# visualizer.py
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.figure import Figure
+from datetime import datetime, timedelta, timezone
+
+from math_models import CosineModeler
+from domain_models import EventData, PredictionResult
+
+class Visualizer:
+    def __init__(self, output_dir='output', tz_offset=8):
+        self.output_dir = output_dir
+        self.tz_offset = tz_offset
+        self.modeler = CosineModeler()
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+    def _to_real_time(self, hours_array, start_ts):
+        """将相对小时数转换为本地时间对象"""
+        start_dt_utc = datetime.fromtimestamp(start_ts / 1000, timezone.utc)
+        start_dt_local = (start_dt_utc + timedelta(hours=self.tz_offset)).replace(tzinfo=None)
+        deltas = pd.to_timedelta(hours_array, unit='h')
+        return start_dt_local + deltas
+
+    def plot_prediction(self, target: EventData, result: PredictionResult, 
+                        debug_hours: float = None, save=True):
+        """绘制最终预测图 (包含真实未来对比)"""
+        
+        start_ts = target.meta.start_at
+        
+        # 1. 准备基础时间轴
+        obs_time = self._to_real_time(target.df['hours_elapsed'].values, start_ts)
+        pred_time = self._to_real_time(result.future_t, start_ts)
+        full_time = self._to_real_time(result.full_t_score, start_ts)
+        
+        # 重算骨架曲线
+        skeleton_y = self.modeler.shape_function(
+            result.future_t, 
+            *result.used_params, 
+            target.meta.total_hours
+        )
+        
+        now_hours = debug_hours if debug_hours else target.df['hours_elapsed'].max()
+        now_dt = self._to_real_time([now_hours], start_ts)[0]
+
+        # 2. 绘图设置
+        fig = Figure(figsize=(12, 10))
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
+        date_fmt = mdates.DateFormatter('%m-%d %H:%M')
+
+        # --- Subplot 1: Speed ---
+        # 观测骨架
+        if 'skeleton_speed' in target.df.columns:
+            ax1.scatter(obs_time, target.df['skeleton_speed'], s=10, c='gray', alpha=0.3, label='Observed Skeleton')
+        
+        # 预测骨架
+        ax1.plot(pred_time, skeleton_y, color='blue', linestyle='--', alpha=0.5, label='Predicted Skeleton')
+
+        # 观测速度 (截断后)
+        ax1.plot(obs_time, target.df['norm_speed'], c='red', lw=2, label='Observed Speed')
+        
+        # 预测速度
+        ax1.plot(pred_time, result.future_speed, c='green', lw=2, alpha=0.8, label='Predicted Speed')
+        
+        # [新增] 真实未来速度 (橙色线)
+        if target.full_df is not None:
+            full_df = target.full_df
+            # 筛选出当前时间之后的数据
+            mask_future = full_df['hours_elapsed'] > now_hours
+            if mask_future.any():
+                future_real_time = self._to_real_time(full_df.loc[mask_future, 'hours_elapsed'].values, start_ts)
+                future_real_speed = full_df.loc[mask_future, 'norm_speed'].values
+                ax1.plot(future_real_time, future_real_speed, 
+                         color='orange', linestyle='-.', linewidth=2, alpha=0.9, label='Actual Future Speed')
+
+        ax1.axvline(x=now_dt, color='black', linestyle=':', label='Now')
+        ax1.set_title(f"Event {target.meta.event_id} Speed Prediction")
+        ax1.set_ylabel("Normalized Speed")
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        ax1.xaxis.set_major_formatter(date_fmt)
+
+        # --- Subplot 2: Score ---
+        # 观测分数 (截断后)
+        ax2.plot(obs_time, target.df['value'], c='red', lw=2, label='Observed Score')
+        
+        # 预测分数曲线
+        ax2.plot(full_time, result.full_score, c='purple', ls='--', lw=2, label='Predicted Curve')
+        
+        # [修正] 真实分数曲线 (全量) - 仅在回测(debug_hours不为空)时绘制
+        real_final_score = 0
+        if debug_hours is not None and target.full_df is not None:
+            full_df = target.full_df
+            full_real_time = self._to_real_time(full_df['hours_elapsed'].values, start_ts)
+            
+            # 只有当 full_df 确实包含比当前观测点更未来的数据时才画
+            if not full_df.empty:
+                ax2.plot(full_real_time, full_df['value'], c='orange', alpha=0.4, lw=1, label='Actual Curve')
+                
+                # 获取真实最终分
+                real_final_score = full_df.iloc[-1]['value']
+                # [修正语法错误] DatetimeIndex 不支持 .iloc，直接用 [-1]
+                real_final_time = full_real_time[-1] 
+                
+                # 绘制深红点
+                ax2.scatter(real_final_time, real_final_score, color='darkred', s=60, zorder=5, label='Actual Final')
+
+        # --- 文字标签 (三巨头) ---
+        # 1. 当前分 (Current)
+        current_score = target.df['value'].max() if not target.df.empty else 0
+        ax2.text(now_dt, current_score, f" Cur: {int(current_score):,}", 
+                 ha='left', va='top', fontsize=10, color='red', fontweight='bold')
+
+        # 2. 预测最终分 (Predicted)
+        final_t = full_time[-1]
+        final_s = result.final_score
+        ax2.text(final_t, final_s, f"Pred: {int(final_s):,}\n", 
+                 ha='right', va='bottom', fontsize=11, fontweight='bold', color='purple')
+
+        # 3. 真实最终分 (Actual) - 仅在回测且有值时显示
+        if real_final_score > 0:
+            # 为了防止和预测分重叠，如果两者接近，稍微错开一点位置
+            offset_y = 0
+            if abs(real_final_score - final_s) < (final_s * 0.05):
+                offset_y = - (final_s * 0.05) # 向下挪一点
+            
+            # 计算真实结束时间
+            real_final_t = self._to_real_time([target.meta.total_hours], start_ts)[0]
+            ax2.text(real_final_t, real_final_score + offset_y, f"\nAct: {int(real_final_score):,}", 
+                     ha='right', va='top', fontsize=11, fontweight='bold', color='darkred')
+
+        ax2.axvline(x=now_dt, color='black', linestyle=':')
+        ax2.set_title(f"Score Prediction: {int(final_s):,} PT")
+        ax2.set_ylabel("Event Points")
+        ax2.set_xlabel("Local Time")
+        ax2.legend(loc='lower right')
+        ax2.grid(True, alpha=0.3)
+        ax2.xaxis.set_major_formatter(date_fmt)
+        
+        # 水印
+        try:
+            wm_text = "@byydzh mycx 1000"
+            fig.text(0.99, 0.01, wm_text, fontsize=10, color='gray', alpha=0.6,
+                     ha='right', va='bottom', zorder=100)
+        except Exception:
+            pass
+
+        fig.autofmt_xdate()
+        fig.tight_layout()
+
+        if save:
+            ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            fname = f"pred_{target.meta.event_id}_{ts_str}.png"
+            out_path = os.path.join(self.output_dir, str(target.meta.event_id))
+            os.makedirs(out_path, exist_ok=True)
+            full_path = os.path.join(out_path, fname)
+            fig.savefig(full_path, dpi=150)
+            print(f"绘图已保存: {full_path}")
+            return full_path
+        
+        return fig

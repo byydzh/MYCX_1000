@@ -1,17 +1,64 @@
+# app.py
 import streamlit as st
 import time
 import traceback
+import numpy as np
+import pandas as pd
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-# 引入后端逻辑
+# 引入新架构的组件
 from config import DEFAULT_CONFIG
-from predictor import DataHandler, fetch_recent_json, get_current_event_for_server
+from data_source import BestdoriDataSource
+from domain_models import EventData, EventMeta
+from math_models import SeasonalityHandler, CosineModeler
+from prediction_engine import PredictionEngine
+from visualizer import Visualizer
+
+# ==========================================
+# 0. 辅助函数 (从 main_pipeline 复用逻辑)
+# ==========================================
+def wrap_event_data(data_pack) -> EventData:
+    """将原始数据包转换为领域对象"""
+    if not data_pack: return None
+    meta_obj = data_pack['meta']
+    if isinstance(meta_obj, dict):
+        meta_obj = EventMeta.from_dict(data_pack['event_id'], meta_obj)
+        
+    return EventData(
+        meta=meta_obj,
+        df=data_pack['dataframe'],
+        scale=data_pack['scale']
+    )
+
+def calculate_derived_columns(event_data: EventData) -> EventData:
+    """计算派生列：hours_elapsed, speed, norm_speed"""
+    df = event_data.df
+    event_data.clean_data()
+    
+    # 简单的维护延迟修正逻辑 (简化版，仅用于计算)
+    start_ts = event_data.meta.start_at
+    df['hours_elapsed'] = (df['time'] - start_ts) / 3600000.0
+    
+    if 'speed' not in df.columns:
+        diff_val = df['value'].diff()
+        diff_time = df['time'].diff() / 60000.0 
+        speed = diff_val / diff_time
+        df['speed'] = speed.fillna(0.0)
+        df.loc[~np.isfinite(df['speed']), 'speed'] = 0.0
+        df.loc[df['speed'] < 0, 'speed'] = 0.0
+        
+    if 'norm_speed' not in df.columns:
+        df['norm_speed'] = df['speed'] / event_data.scale
+        
+    event_data.df = df
+    return event_data
 
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="自动预测面板", page_icon="🐱", layout="wide")
-
+st.set_page_config(page_title="预测面板", page_icon="🐱", layout="wide")
 st.title("🐱 实时预测面板")
 
 # ==========================================
@@ -21,8 +68,6 @@ if 'img_bytes' not in st.session_state:
     st.session_state['img_bytes'] = None
 if 'last_update_str' not in st.session_state:
     st.session_state['last_update_str'] = "暂无数据"
-
-# 用于判断是否是首次加载的 Flag
 if 'has_initialized' not in st.session_state:
     st.session_state['has_initialized'] = False
 
@@ -30,81 +75,42 @@ if 'has_initialized' not in st.session_state:
 # 3. 侧边栏控制
 # ==========================================
 st.sidebar.header("控制台 🎮")
-
 manual_btn = st.sidebar.button("⚡ 立即运行预测", type="primary")
 
-# --- 高级参数配置 (Advanced Config) ---
 st.sidebar.markdown("---")
-with st.sidebar.expander("参数设置"):
+with st.sidebar.expander("参数设置", expanded=False):
     st.caption("调整下列参数将覆盖 config.py 的默认值")
     
-    # 1. 模型参数
+    # 模型参数
     st.markdown("**模型参数**")
-    weekend_mult = st.slider(
-        "周末增强系数", 
-        min_value=0.8, max_value=1.5, step=0.05,
-        value=DEFAULT_CONFIG.get('weekend_multiplier', 1.0),
-        help="大于1.0表示预测周末相较工作日会有额外增幅，注意并非一定会让预测值上升，这主要作用于模型预测速度分布的形状"
-    )
+    weekend_mult = st.slider("周末增强系数", 0.8, 1.5, DEFAULT_CONFIG.get('weekend_multiplier', 1.0), 0.05)
+    panic_scaler = st.slider("恐慌期最小加速倍数", 1.0, 3.0, DEFAULT_CONFIG.get('panic_scaler', 1.1), 0.05)
+    panic_ease_power = st.slider("恐慌期缓动指数", 0.1, 5.0, DEFAULT_CONFIG.get('panic_ease_power', 1.0), 0.1)
+    similar_count = st.number_input("参考历史活动数", 1, 10, DEFAULT_CONFIG.get('similar_count', 5))
 
-    panic_scaler = st.slider(
-        "恐慌期最小加速倍数",
-        min_value=1.0, max_value=3.0, step=0.05,
-        value=DEFAULT_CONFIG.get('panic_scaler', 1.1),
-        help="恐慌期的最小加速倍数，数值越大表示加速效果越明显"
-    )
+    # 阈值与限制
+    st.markdown("**阈值与限制**")
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        ratio_min = st.number_input("Ratio Min", value=DEFAULT_CONFIG.get('ratio_min', 0.25), step=0.05)
+        scale_min = st.number_input("Scale Min", value=DEFAULT_CONFIG.get('scale_min', 0.5), step=0.1)
+        t_start_cmp = st.number_input("对比窗口起始", value=DEFAULT_CONFIG.get('t_start_cmp', 6.0), step=0.5)
+    with col_p2:
+        ratio_max = st.number_input("Ratio Max", value=DEFAULT_CONFIG.get('ratio_max', 4.0), step=0.1)
+        scale_max = st.number_input("Scale Max", value=DEFAULT_CONFIG.get('scale_max', 2.0), step=0.1)
+        t_end_cap = st.number_input("窗口结束上限", value=DEFAULT_CONFIG.get('t_end_cap', 72.0), step=1.0)
 
-    panic_ease_power = st.slider(
-        "恐慌期缓动指数",
-        min_value=0.1, max_value=5.0, step=0.1,
-        value=DEFAULT_CONFIG.get('panic_ease_power', 1.0),
-        help="控制恐慌期的缓动效果，数值越大“龙抬头”效果越晚"
-    )
-    
-    similar_count = st.number_input(
-        "参考历史活动数",
-        min_value=1, max_value=10, step=1,
-        value=DEFAULT_CONFIG.get('similar_count', 5),
-        help="不建议调整，更不建议设置太少"
-    )
+    # 回测与平滑
+    st.markdown("**回测与平滑**")
+    corr_min = st.number_input("24h 修正下限", value=DEFAULT_CONFIG.get('corr_min', 0.6), step=0.05)
+    corr_max = st.number_input("24h 修正上限", value=DEFAULT_CONFIG.get('corr_max', 1.6), step=0.05)
+    smooth_thresh1 = st.number_input("平滑阈值 1", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_thresh1', 0.5), 0.01)
+    smooth_thresh2 = st.number_input("平滑阈值 2", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_thresh2', 0.65), 0.01)
+    smooth_hard_cap = st.number_input("绝对硬顶", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_hard_cap', 0.8), 0.01)
 
-    st.markdown("以下参数不建议轻易调整")
-
-    # 2. 阈值与限制
-    with st.sidebar.expander("阈值与限制"):
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            ratio_min = st.number_input("Ratio Min", value=DEFAULT_CONFIG.get('ratio_min', 0.25), step=0.05)
-            scale_min = st.number_input("Scale Min", value=DEFAULT_CONFIG.get('scale_min', 0.5), step=0.1)
-            # 对比窗口起始时间 (小时)
-            t_start_cmp = st.number_input(
-                "对比窗口起始 (小时)", min_value=0.0, value=DEFAULT_CONFIG.get('t_start_cmp', 6.0), step=0.5,
-                help="用于计算历史相似性时跳过开局不稳定（常被维护时间占用）的时间（小时）"
-            )
-        with col_p2:
-            ratio_max = st.number_input("Ratio Max", value=DEFAULT_CONFIG.get('ratio_max', 4.0), step=0.1)
-            scale_max = st.number_input("Scale Max", value=DEFAULT_CONFIG.get('scale_max', 2.0), step=0.1)
-            # 对比窗口结束上限 (小时)
-            t_end_cap = st.number_input(
-                "窗口结束上限 (小时)", min_value=1.0, value=DEFAULT_CONFIG.get('t_end_cap', 72.0), step=1.0,
-                help="历史对比时考虑的最大小时数，上限用于避免中后期数据干扰"
-            )
-
-    # 3. 24h 回测修正与顶部平滑阈值
-    with st.sidebar.expander("回测与平滑设置"):
-        corr_min = st.number_input("24h 回测修正下限", value=DEFAULT_CONFIG.get('corr_min', 0.6), step=0.05)
-        corr_max = st.number_input("24h 回测修正上限", value=DEFAULT_CONFIG.get('corr_max', 1.6), step=0.05)
-
-        st.markdown("**顶部平滑阈值**")
-        smooth_thresh1 = st.number_input("轻微衰减阈值 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_thresh1', 0.5), step=0.01)
-        smooth_thresh2 = st.number_input("强力衰减阈值 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_thresh2', 0.65), step=0.01)
-        smooth_hard_cap = st.number_input("绝对硬顶 (比例)", min_value=0.0, max_value=1.0, value=DEFAULT_CONFIG.get('smooth_hard_cap', 0.8), step=0.01)
-
-# --- 调试回测 ---
+# 调试模式
 st.sidebar.markdown("---")
-st.sidebar.header("调试测试 🛠️")
 enable_debug = st.sidebar.checkbox("启用调试模式", value=False)
-
 if enable_debug:
     debug_event_id = st.sidebar.number_input("目标 Event ID", min_value=1, value=312, step=1)
     debug_hours_input = st.sidebar.number_input("冻结时间 (小时)", min_value=0.0, value=60.0, step=1.0, format="%.1f")
@@ -112,13 +118,9 @@ else:
     debug_event_id = None
     debug_hours_input = None
 
-
 # ==========================================
-# 4. 核心逻辑 (首次自动 + 手动触发)
+# 4. 核心逻辑
 # ==========================================
-
-# 判定逻辑：如果是(手动点击) 或者 (当前Session还没初始化过)
-# 注意：Streamlit 每次交互都会重跑脚本，所以要用 session_state 锁住自动运行
 should_run = False
 trigger_reason = ""
 
@@ -127,73 +129,99 @@ if manual_btn:
     trigger_reason = "手动触发"
 elif not st.session_state['has_initialized']:
     should_run = True
-    trigger_reason = "首次加载自动运行"
-    # 标记为已初始化，防止后续只要刷新页面就重跑（除非彻底刷新浏览器Tab）
+    trigger_reason = "首次加载"
     st.session_state['has_initialized'] = True
 
 if should_run:
-    with st.spinner(f"🐱 ({trigger_reason}) 正在获取数据并绘图..."):
+    # 构造本次运行的配置字典
+    current_config = DEFAULT_CONFIG.copy()
+    current_config.update({
+        'weekend_multiplier': weekend_mult,
+        'panic_scaler': panic_scaler,
+        'panic_ease_power': panic_ease_power,
+        'similar_count': int(similar_count),
+        'ratio_min': ratio_min, 'ratio_max': ratio_max,
+        'scale_min': scale_min, 'scale_max': scale_max,
+        't_start_cmp': t_start_cmp, 't_end_cap': t_end_cap,
+        'corr_min': corr_min, 'corr_max': corr_max,
+        'smooth_thresh1': smooth_thresh1, 'smooth_thresh2': smooth_thresh2,
+        'smooth_hard_cap': smooth_hard_cap
+    })
+
+    with st.spinner(f"🐱 ({trigger_reason}) 正在计算中..."):
+        ds = BestdoriDataSource()
         try:
-            if enable_debug and debug_event_id is not None:
-                target_event_id = int(debug_event_id)
-                target_debug_hours = float(debug_hours_input) if debug_hours_input is not None else None
+            # 1. 获取目标 ID
+            if enable_debug and debug_event_id:
+                target_eid = int(debug_event_id)
+                target_debug_h = float(debug_hours_input)
             else:
-                recent = fetch_recent_json()
-                target_event_id = get_current_event_for_server(recent, server_index=3)
-                target_debug_hours = None
-
-            if target_event_id is None:
-                st.error("未找到活动 ID！")
+                target_eid = ds.get_current_event_id()
+                target_debug_h = None
+            
+            if not target_eid:
+                st.error("无法获取当前活动 ID，请检查网络或手动指定。")
             else:
-                # --- 构建配置覆盖字典 ---
-                user_config_overrides = {
-                    'weekend_multiplier': weekend_mult,
-                    'panic_scaler': float(panic_scaler),
-                    'panic_ease_power': float(panic_ease_power),
-                    'similar_count': int(similar_count),
-                    'ratio_min': float(ratio_min),
-                    'ratio_max': float(ratio_max),
-                    'scale_min': float(scale_min),
-                    'scale_max': float(scale_max),
-                    't_start_cmp': float(t_start_cmp),
-                    't_end_cap': float(t_end_cap),
-                    'corr_min': float(corr_min),
-                    'corr_max': float(corr_max),
-                    'smooth_thresh1': float(smooth_thresh1),
-                    'smooth_thresh2': float(smooth_thresh2),
-                    'smooth_hard_cap': float(smooth_hard_cap)
-                }
+                # 2. 获取目标数据
+                target_pack = ds.fetch_event_data_pack(target_eid)
+                if not target_pack:
+                    st.error(f"无法获取活动 {target_eid} 的详细数据。")
+                else:
+                    target_data = wrap_event_data(target_pack)
+                    target_data = calculate_derived_columns(target_data)
+                    target_data.full_df = target_data.df.copy() # 保存上帝视角副本
 
-                # --- 传入 config_overrides ---
-                handler = DataHandler(
-                    target_event_id, 
-                    debug_hours=target_debug_hours,
-                    config_overrides=user_config_overrides
-                )
-                
-                handler.load_target_data()
-                handler.find_similar_events()
+                    # 截断逻辑
+                    if target_debug_h:
+                        limit_ts = target_data.meta.start_at + (target_debug_h * 3600 * 1000)
+                        target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()
 
-                new_img = handler.run_prediction(return_type='bytes')
-
-                if new_img:
-                    st.session_state['img_bytes'] = new_img
+                    # 3. 获取历史数据
+                    similar_packs = ds.find_similar_events(
+                        target_eid, target_data.meta.event_type, count=int(similar_count)
+                    )
+                    history_events = []
+                    for pack in similar_packs:
+                        h_data = wrap_event_data(pack)
+                        try:
+                            h_data = calculate_derived_columns(h_data)
+                            history_events.append(h_data)
+                        except: pass
                     
-                    # --- 时间处理部分 ---
-                    # 定义北京时区 (UTC+8)
+                    # 4. 初始化引擎组件
+                    seasonality = SeasonalityHandler(
+                        weekend_multiplier=float(weekend_mult),
+                        panic_scaler=float(panic_scaler),
+                        panic_ease_power=float(panic_ease_power)
+                    )
+                    modeler = CosineModeler()
+                    engine = PredictionEngine(seasonality, modeler, config=current_config)
+                    visualizer = Visualizer()
+
+                    # 5. 执行预测
+                    result = engine.predict(target_data, history_events, debug_hours=target_debug_h)
+
+                    # 6. 绘图 (内存操作)
+                    fig = visualizer.plot_prediction(target_data, result, debug_hours=target_debug_h, save=False)
+                    
+                    # 转 BytesIO
+                    buf = BytesIO()
+                    FigureCanvasAgg(fig).print_png(buf)
+                    buf.seek(0)
+                    st.session_state['img_bytes'] = buf
+                    
+                    # 更新时间
                     beijing_tz = timezone(timedelta(hours=8))
-                    # 获取当前UTC时间并转换为北京时间
-                    now_bj = datetime.now(beijing_tz)
-                    st.session_state['last_update_str'] = now_bj.strftime('%H:%M:%S (北京时间)')
+                    st.session_state['last_update_str'] = datetime.now(beijing_tz).strftime('%H:%M:%S')
                     
                     if manual_btn:
-                        st.success(f"刷新成功！(Event {target_event_id})")
-                else:
-                    st.warning("计算完成，但没有生成图片数据。")
+                        st.success(f"预测完成！Event {target_eid} | Final: {int(result.final_score):,}")
 
         except Exception as e:
             st.error(f"运行出错: {str(e)}")
-            print(traceback.format_exc())
+            st.code(traceback.format_exc())
+        finally:
+            ds.close()
 
 # ==========================================
 # 5. 结果展示
@@ -208,12 +236,11 @@ with col_img:
             width="content"
         )
     else:
-        # 如果首次运行出错导致没有图片，这里会显示
-        st.info("🐱 似乎没有数据呢，请检查网络或点击按钮重试...")
+        st.info("🐱 暂无数据，正在等待初始化或手动触发...")
 
 with col_info:
     st.markdown("### 状态面板")
-    # 这里会显示明确的北京时间
     st.write(f"最后更新: **{st.session_state['last_update_str']}**")
     
-    st.caption("机制说明：首次进入自动刷新，后续需手动点击按钮。")
+    if st.session_state.get('img_bytes'):
+         st.success("系统运行正常 喵！")
