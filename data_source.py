@@ -5,8 +5,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 
-# 假设 base_distribution 还在原来的位置，我们需要用到它里面的基础抓取函数
-# 如果您打算彻底重构，以后这些也可以移进来，但现在先保持兼容
 from base_distribution import (
     fetch_event_meta,
     fetch_tier_1000_data,
@@ -200,10 +198,10 @@ class BestdoriDataSource:
                 except Exception:
                     pass
         
-        # 2. 【关键】对结果进行排序，确保确定性！
+        # 2. 对结果进行排序，确保确定性！
         # 按 event_id 倒序排列（优先用最近的活动），然后切片取前 count 个
         results.sort(key=lambda x: x['event_id'], reverse=True)
         final_results = results[:count]
         
-        print(f"最终选定参考活动: {[r['event_id'] for r in final_results]}")
+        # print(f"最终选定参考活动: {[r['event_id'] for r in final_results]}")
         return final_results

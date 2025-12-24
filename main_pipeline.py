@@ -104,13 +104,13 @@ class PredictionPipeline:
         
         target_data = self._wrap_event_data(target_pack)
         
-        # [关键修改] 先在完整数据上计算派生列 (speed, hours_elapsed)
+        # 先在完整数据上计算派生列 (speed, hours_elapsed)
         target_data = self._calculate_derived_columns(target_data)
         
-        # [关键修改] 保存一份完整数据的副本到 full_df
+        # 保存一份完整数据的副本到 full_df
         target_data.full_df = target_data.df.copy()
 
-        # [关键修改] 然后再进行截断，传给 Engine 的 df 是残缺的
+        # 然后再进行截断，传给 Engine 的 df 是残缺的
         if debug_hours:
             limit_ts = target_data.meta.start_at + (debug_hours * 3600 * 1000)
             target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()

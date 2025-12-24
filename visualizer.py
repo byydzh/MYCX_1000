@@ -66,7 +66,7 @@ class Visualizer:
         # 预测速度
         ax1.plot(pred_time, result.future_speed, c='green', lw=2, alpha=0.8, label='Predicted Speed')
         
-        # [新增] 真实未来速度 (橙色线)
+        # 真实未来速度 (橙色线)
         if target.full_df is not None:
             full_df = target.full_df
             # 筛选出当前时间之后的数据
@@ -91,7 +91,7 @@ class Visualizer:
         # 预测分数曲线
         ax2.plot(full_time, result.full_score, c='purple', ls='--', lw=2, label='Predicted Curve')
         
-        # [修正] 真实分数曲线 (全量) - 仅在回测(debug_hours不为空)时绘制
+        # 真实分数曲线 (全量) - 仅在回测(debug_hours不为空)时绘制
         real_final_score = 0
         if debug_hours is not None and target.full_df is not None:
             full_df = target.full_df
@@ -125,8 +125,8 @@ class Visualizer:
         if real_final_score > 0:
             # 为了防止和预测分重叠，如果两者接近，稍微错开一点位置
             offset_y = 0
-            if abs(real_final_score - final_s) < (final_s * 0.05):
-                offset_y = - (final_s * 0.05) # 向下挪一点
+            if abs(real_final_score - final_s) < (final_s * 0.15):
+                offset_y = + (final_s * 0.1) # 向上挪一点
             
             # 计算真实结束时间
             real_final_t = self._to_real_time([target.meta.total_hours], start_ts)[0]

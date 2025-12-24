@@ -303,7 +303,6 @@ class PredictionEngine:
         )
         
         # 6. 计算 Scale Factor (积分对齐 + 24h回测)
-        # 喵！这里就是之前 TODO 的地方，现在已经补全啦！
         scale_factor = self._calculate_scale_factor(target, future_t, speed_pred_norm)
         
         # 7. 应用平滑压制

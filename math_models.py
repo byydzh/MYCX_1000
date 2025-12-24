@@ -87,9 +87,33 @@ class SeasonalityHandler:
             if total_hours and t_panic > 0:
                 left = total_hours - h
                 if left < t_panic:
+                    # prog 是进度条：1.0 表示刚进入恐慌期，0.0 表示活动结束
+                    # 注意：这里原本的逻辑可能是反的或者需要确认，
+                    # 假设 left 越小（越接近结束），我们要的恐慌效应越强。
+                    # 原代码：prog = 1.0 - (left / t_panic) -> 刚进恐慌期是0，结束时是1
                     prog = 1.0 - (max(0, left) / t_panic)
+                    
+                    # eased 是经过非线性曲线调整后的强度系数 (0.0 ~ 1.0)
                     eased = float(np.power(prog, self.panic_ease_power)) if prog > 0 else 0
-                    final = raw * (1.0 - eased) + max(raw, self.panic_scaler) * eased
+                    
+                    # 旧逻辑：混合向 panic_scaler，抹平了昼夜差
+                    # final = raw * (1.0 - eased) + max(raw, self.panic_scaler) * eased
+                    
+                    # 新逻辑（乘法增益）：
+                    # 保持昼夜节律的形状，只是整体幅度变大。
+                    # 比如 panic_scaler 是 1.5 (最后时刻加速50%)
+                    # 白天 raw=1.2 -> 1.2 * (1 + 0.5) = 1.8 (猛冲)
+                    # 晚上 raw=0.1 -> 0.1 * (1 + 0.5) = 0.15 (还是在睡觉，只是稍微有一点点动静)
+                    
+                    # 我们可以定义一个 boost_factor
+                    # 假设 self.panic_scaler 是目标倍率（比如1.2倍或1.5倍）
+                    # 这里的公式意思是：基础值 + (基础值 * 增量比例 * 进度权重)
+                    final = raw * (1.0 + (self.panic_scaler - 1.0) * eased)
+                    
+                    # 如果希望晚上稍微“睡得少一点”（即波谷抬升），可以加一个极小的底数：
+                    # final = final + (0.1 * eased) 
+                    # 但为了严谨，上面的乘法逻辑最符合“保留曲线形状”的要求喵。
+
             factors.append(final)
             y_final.append(y_skeleton[i] * final)
         return np.array(y_final), np.array(factors)
