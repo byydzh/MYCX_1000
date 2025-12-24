@@ -91,6 +91,23 @@ $$
 \text{Scale}_{final}(t) = \text{Scale}_{KF}(t) \cdot (1 - \lambda(t)^2) + 1.0 \cdot \lambda(t)^2
 $$
 
+#### D. 时长归一化 (Time-Scale Normalization)
+**来源：** `prediction_engine.py` -> `predict` (Time-Scale Fix)
+
+为了解决超长活动（如 12 天 vs 常规 8 天）导致的 $t^2$ 二次项爆炸问题（Long-duration Overfitting），模型引入了基于量纲分析的物理时长修正。
+
+假设历史平均时长为 $T_{hist}$（通常约 192h），当前目标活动时长为 $T_{curr}$，定义时长倍率 $R_{len} = T_{curr} / T_{hist}$。
+
+为了保持在相同相对进度（Relative Progress）下的**速度量级**不变，基础生长参数需按时间量纲进行稀释：
+
+$$
+A_{final} = A_{raw} / R_{len} \quad (\text{线性速度项，量纲 } [T]^{-1})
+$$
+
+$$
+B_{final} = B_{raw} / (R_{len})^2 \quad (\text{加速度项，量纲 } [T]^{-2})
+$$
+
 ---
 
 ### 4. 极值压制 (Smoothing / Diminishing Returns)
