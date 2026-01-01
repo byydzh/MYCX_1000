@@ -7,6 +7,10 @@ import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from datetime import datetime, timedelta, timezone
 
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
 from math_models import CosineModeler
 from domain_models import EventData, PredictionResult
 
@@ -55,16 +59,16 @@ class Visualizer:
         # --- Subplot 1: Speed ---
         # 观测骨架
         if 'skeleton_speed' in target.df.columns:
-            ax1.scatter(obs_time, target.df['skeleton_speed'], s=10, c='gray', alpha=0.3, label='Observed Skeleton')
+            ax1.scatter(obs_time, target.df['skeleton_speed'], s=10, c='gray', alpha=0.3, label='观测骨架')
         
         # 预测骨架
-        ax1.plot(pred_time, skeleton_y, color='blue', linestyle='--', alpha=0.5, label='Predicted Skeleton')
+        ax1.plot(pred_time, skeleton_y, color='blue', linestyle='--', alpha=0.5, label='预测骨架')
 
         # 观测速度 (截断后)
-        ax1.plot(obs_time, target.df['norm_speed'], c='red', lw=2, label='Observed Speed')
+        ax1.plot(obs_time, target.df['norm_speed'], c='red', lw=2, label='观测速度')
         
         # 预测速度
-        ax1.plot(pred_time, result.future_speed, c='green', lw=2, alpha=0.8, label='Predicted Speed')
+        ax1.plot(pred_time, result.future_speed, c='green', lw=2, alpha=0.8, label='预测速度')
         
         # 真实未来速度 (橙色线)
         if target.full_df is not None:
@@ -74,22 +78,22 @@ class Visualizer:
             if mask_future.any():
                 future_real_time = self._to_real_time(full_df.loc[mask_future, 'hours_elapsed'].values, start_ts)
                 future_real_speed = full_df.loc[mask_future, 'norm_speed'].values
-                ax1.plot(future_real_time, future_real_speed, 
-                         color='orange', linestyle='-.', linewidth=2, alpha=0.9, label='Actual Future Speed')
+                ax1.plot(future_real_time, future_real_speed,
+                         color='orange', linestyle='-.', linewidth=2, alpha=0.9, label='实际未来速度')
 
-        ax1.axvline(x=now_dt, color='black', linestyle=':', label='Now')
-        ax1.set_title(f"Event {target.meta.event_id} Speed Prediction")
-        ax1.set_ylabel("Normalized Speed")
+        ax1.axvline(x=now_dt, color='black', linestyle=':', label='当前时刻')
+        ax1.set_title(f"活动 {target.meta.event_id} 速度预测")
+        ax1.set_ylabel("归一化速度")
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(date_fmt)
 
         # --- Subplot 2: Score ---
         # 观测分数 (截断后)
-        ax2.plot(obs_time, target.df['value'], c='red', lw=2, label='Observed Score')
+        ax2.plot(obs_time, target.df['value'], c='red', lw=2, label='观测分数')
         
         # 预测分数曲线
-        ax2.plot(full_time, result.full_score, c='purple', ls='--', lw=2, label='Predicted Curve')
+        ax2.plot(full_time, result.full_score, c='purple', ls='--', lw=2, label='预测曲线')
         
         # 真实分数曲线 (全量) - 仅在回测(debug_hours不为空)时绘制
         real_final_score = 0
@@ -99,26 +103,26 @@ class Visualizer:
             
             # 只有当 full_df 确实包含比当前观测点更未来的数据时才画
             if not full_df.empty:
-                ax2.plot(full_real_time, full_df['value'], c='orange', alpha=0.4, lw=1, label='Actual Curve')
+                ax2.plot(full_real_time, full_df['value'], c='orange', alpha=0.4, lw=1, label='实际曲线')
                 
                 # 获取真实最终分
                 real_final_score = full_df.iloc[-1]['value']
                 # [修正语法错误] DatetimeIndex 不支持 .iloc，直接用 [-1]
-                real_final_time = full_real_time[-1] 
+                real_final_time = full_real_time[-1]
                 
                 # 绘制深红点
-                ax2.scatter(real_final_time, real_final_score, color='darkred', s=60, zorder=5, label='Actual Final')
+                ax2.scatter(real_final_time, real_final_score, color='darkred', s=60, zorder=5, label='实际最终分')
 
         # --- 文字标签 (三巨头) ---
         # 1. 当前分 (Current)
         current_score = target.df['value'].max() if not target.df.empty else 0
-        ax2.text(now_dt, current_score, f" Cur: {int(current_score):,}", 
+        ax2.text(now_dt, current_score, f" 当前: {int(current_score):,}",
                  ha='left', va='top', fontsize=10, color='red', fontweight='bold')
 
         # 2. 预测最终分 (Predicted)
         final_t = full_time[-1]
         final_s = result.final_score
-        ax2.text(final_t, final_s, f"Pred: {int(final_s):,}\n", 
+        ax2.text(final_t, final_s, f"预测: {int(final_s):,}\n",
                  ha='right', va='bottom', fontsize=11, fontweight='bold', color='purple')
 
         # 3. 真实最终分 (Actual) - 仅在回测且有值时显示
@@ -130,13 +134,13 @@ class Visualizer:
             
             # 计算真实结束时间
             real_final_t = self._to_real_time([target.meta.total_hours], start_ts)[0]
-            ax2.text(real_final_t, offset_y, f"\nAct: {int(real_final_score):,}", 
+            ax2.text(real_final_t, offset_y, f"\n实际: {int(real_final_score):,}",
                      ha='right', va='top', fontsize=11, fontweight='bold', color='darkred')
 
         ax2.axvline(x=now_dt, color='black', linestyle=':')
-        ax2.set_title(f"Score Prediction: {int(final_s):,} PT")
-        ax2.set_ylabel("Event Points")
-        ax2.set_xlabel("Local Time")
+        ax2.set_title(f"分数预测: {int(final_s):,} PT")
+        ax2.set_ylabel("活动分数")
+        ax2.set_xlabel("本地时间")
         ax2.legend(loc='lower right')
         ax2.grid(True, alpha=0.3)
         ax2.xaxis.set_major_formatter(date_fmt)
