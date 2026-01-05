@@ -293,6 +293,122 @@ class PredictionEngine:
             logger.error(f"Error in Kalman Filter: {e}")
             return 1.0, np.ones_like(future_t)
 
+    def _generate_hypothetical_path(self, target: EventData, manual_points: List[dict],
+                                    pred_params: np.ndarray) -> Tuple[pd.DataFrame, float]:
+        """
+        生成连接当前数据末尾到人工干预点的“符合节律的”虚拟路径。
+        
+        Args:
+            target: 当前真实数据
+            manual_points: 人工干预点列表 [{'hours': h, 'score': s}, ...]
+            pred_params: 基础预测参数 (用于生成形状)
+            
+        Returns:
+            synthetic_df: 包含真实数据+虚拟路径的完整 DataFrame
+            last_manual_time: 最后一个人工点的时间 (新的 "Now")
+        """
+        if not manual_points:
+            return target.df, target.df['hours_elapsed'].max()
+
+        # 1. 排序并过滤无效点
+        sorted_points = sorted(manual_points, key=lambda x: x['hours'])
+        current_max_time = target.df['hours_elapsed'].max()
+        current_max_score = target.df['value'].max()
+        
+        valid_points = [p for p in sorted_points if p['hours'] > current_max_time and p['score'] > current_max_score]
+        if not valid_points:
+            return target.df, current_max_time
+
+        # 2. 准备基础数据
+        full_df = target.df.copy()
+        last_t = current_max_time
+        last_s = current_max_score
+        
+        total_hours = target.meta.total_hours
+        
+        # 3. 逐段生成路径
+        for pt in valid_points:
+            next_t = float(pt['hours'])
+            next_s = float(pt['score'])
+            
+            if next_t <= last_t: continue
+            
+            # 生成该区间的密集时间点 (每 6 分钟一个点)
+            segment_t = np.arange(last_t, next_t, 0.1)
+            if len(segment_t) == 0: continue
+            
+            # A. 计算该区间的“理论无缩放增量” (Raw Increment)
+            # 使用传入的 pred_params 生成基础骨架
+            skeleton_segment = self.modeler.shape_function(segment_t, *pred_params, total_hours)
+            
+            # 应用节律
+            speed_norm_segment, _ = self.seasonality.apply_seasonality(
+                segment_t, skeleton_segment, target.meta.start_at,
+                total_hours=total_hours, t_panic=pred_params[4]
+            )
+            
+            # 积分得到无缩放的总增量
+            # speed_norm 是归一化的，需要乘 target.scale 才是 pt/hr
+            # 积分: sum(speed * dt)
+            dt = 0.1
+            raw_increment = np.sum(speed_norm_segment * target.scale * dt)
+            
+            # B. 计算所需的 Scale Factor
+            # 我们需要: last_s + raw_increment * required_scale = next_s
+            target_increment = next_s - last_s
+            
+            if raw_increment > 0:
+                required_scale = target_increment / raw_increment
+            else:
+                required_scale = 1.0 # 避免除零，虽然不太可能
+            
+            # C. 生成该段的虚拟数据
+            # Score(t) = last_s + cumsum(speed(t) * scale * dt)
+            # segment_speed_real 单位是 pt/hour
+            segment_speed_real = speed_norm_segment * target.scale * required_scale
+            segment_score_inc = np.cumsum(segment_speed_real * dt)
+            segment_score = last_s + segment_score_inc
+            
+            # D. 构造 DataFrame 片段并追加
+            # 注意：我们需要构造完整的列以保持一致性
+            # time = start_at + hours * 3600 * 1000
+            segment_ts = target.meta.start_at + (segment_t * 3600 * 1000)
+            
+            # 计算 norm_speed
+            # norm_speed = speed(pt/min) / scale
+            # segment_speed_real 是 pt/hour
+            # 所以 speed(pt/min) = segment_speed_real / 60.0
+            # norm_speed = (segment_speed_real / 60.0) / target.scale
+            #            = (speed_norm_segment * target.scale * required_scale / 60.0) / target.scale
+            #            = speed_norm_segment * required_scale / 60.0
+            
+            # calculate_derived_columns 里：
+            # speed = diff_val / diff_time(min)  -> pt/min
+            # norm_speed = speed / scale         -> (pt/min) / scale
+            
+            # 而这里 segment_speed_real 是 pt/hour
+            # 所以对应的 speed (pt/min) 是 segment_speed_real / 60.0
+            speed_pt_min = segment_speed_real / 60.0
+            
+            # 对应的 norm_speed
+            norm_speed_val = speed_pt_min / target.scale
+            
+            segment_df = pd.DataFrame({
+                'hours_elapsed': segment_t,
+                'value': segment_score,
+                'time': segment_ts,
+                'speed': speed_pt_min,
+                'norm_speed': norm_speed_val,
+                'is_manual': True # 标记为人工数据
+            })
+            
+            full_df = pd.concat([full_df, segment_df], ignore_index=True)
+            
+            last_t = next_t
+            last_s = next_s
+
+        return full_df, last_t
+
     def _apply_smoothing(self, speed_pred_norm: np.ndarray, scale_curve: np.ndarray) -> np.ndarray:
         """
         应用高分段的平滑压制逻辑 (Top-speed Smoothing)。
@@ -325,19 +441,24 @@ class PredictionEngine:
 
         return np.minimum(norm_adj, HARD_CAP)
 
-    def predict(self, target: EventData, history: List[EventData], 
-                debug_hours: Optional[float] = None) -> PredictionResult:
+    def predict(self, target: EventData, history: List[EventData],
+                debug_hours: Optional[float] = None,
+                manual_points: Optional[List[dict]] = None) -> PredictionResult:
         """主预测入口。"""
+        
         # 0. 准备数据：去节律化
+        # 注意：如果已经有人工数据，这里 remove_seasonality 可能会有问题，
+        # 但目前 target.df 还是纯净的。
         target.df = self.seasonality.remove_seasonality(target.df)
         
-        # 1. 确定对比窗口
+        # 1. 确定对比窗口 (基于真实数据)
         t_start_cmp = float(self.config.get('t_start_cmp', 6.0))
         observed_hours = float(target.df['hours_elapsed'].max())
         end_source = debug_hours if debug_hours is not None else observed_hours
         t_end_cmp = min(end_source, float(self.config.get('t_end_cap', 72.0)))
         
-        # 2. 计算 Ratio
+        # 2. 计算 Ratio (基于真实数据)
+        # 我们希望 Ratio 反映的是“该活动目前的自然强度”，而不是被人工干预后的强度
         ratio = self._calculate_ratio(target, history, t_start_cmp, t_end_cmp)
         logger.info(f"Calculated Ratio: {ratio:.4f}")
 
@@ -374,6 +495,22 @@ class PredictionEngine:
         pred_params[2] *= ratio        # B
         pred_params[3] *= (ratio ** 1.1) # B_end
         
+        # === 3.5 插入人工干预逻辑 ===
+        # 如果有人工点，我们需要先生成“虚拟历史”，然后基于这个虚拟历史来做后续的 Scale 计算
+        
+        # 标记原始数据，方便绘图区分
+        if 'is_manual' not in target.df.columns:
+            target.df['is_manual'] = False
+            
+        if manual_points:
+            logger.info(f"应用人工干预点: {len(manual_points)} 个")
+            # 使用当前的 pred_params (已应用 Ratio) 来生成符合当前趋势的虚拟路径
+            # 这样生成的路径既符合人工设定的终点，又符合当前活动的节律特征
+            target.df, new_max_time = self._generate_hypothetical_path(target, manual_points, pred_params)
+            logger.info(f"数据已扩展至: {new_max_time:.1f}h")
+            
+        # ==========================
+
         # 4. 生成基础预测曲线 (Skeleton)
         total_hours = target.meta.total_hours
         future_t = np.linspace(0, total_hours, 1000)
@@ -386,6 +523,9 @@ class PredictionEngine:
         )
         
         # 6. 计算 Scale Factor (Kalman Filter)
+        # 注意：此时 target.df 可能已经包含了人工生成的“未来数据”
+        # _calculate_scale_factor 会自动使用最新的数据（包括人工数据）来更新 KF 状态
+        # 从而让预测曲线自然地接在人工路径后面
         base_scale, scale_curve = self._calculate_scale_factor(target, future_t, speed_pred_norm)
         
         # 限制 Scale 对 Panic Term 的过度影响。

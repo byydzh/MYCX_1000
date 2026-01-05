@@ -113,10 +113,51 @@ st.sidebar.markdown("---")
 enable_debug = st.sidebar.checkbox("启用调试模式", value=False)
 if enable_debug:
     debug_event_id = st.sidebar.number_input("目标 Event ID", min_value=1, value=312, step=1)
-    debug_hours_input = st.sidebar.number_input("冻结时间 (小时)", min_value=0.0, value=60.0, step=1.0, format="%.1f")
+    
+    # 冻结时间控制
+    use_max_time = st.sidebar.checkbox("使用最大观测时间 (禁用冻结)", value=False)
+    if not use_max_time:
+        # 支持输入相对小时数 (float) 或 绝对时间 (UTC+8 string)
+        debug_freeze_str = st.sidebar.text_input(
+            "冻结时间 (相对小时 或 UTC+8时间)",
+            value="60.0",
+            help="支持输入数字(如 60.0)表示相对小时，或日期时间(如 2025-11-22 12:00:00)"
+        )
+    else:
+        debug_freeze_str = None
+    
+    # 🔮 假设性干预
+    manual_points_raw = []
+    with st.sidebar.expander("假设性干预", expanded=False):
+        st.caption("输入未来的假设性数据点，每行一个：`YYYY-MM-DD HH:MM 分数`, UTC+8 时间")
+        st.caption("例如：`2025-11-23 18:00 1000000`")
+        
+        manual_text = st.text_area(
+            "输入框",
+            value="",
+            height=100,
+            placeholder="2025-11-23 18:00 1000000\n2025-11-24 09:00 1500000"
+        )
+        
+        if manual_text.strip():
+            for line in manual_text.strip().split('\n'):
+                line = line.strip()
+                if not line: continue
+                # 尝试解析：最后一部分是分数，前面是时间
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        score_val = float(parts[-1])
+                        time_str = " ".join(parts[:-1])
+                        manual_points_raw.append({'time_str': time_str, 'score': score_val})
+                    except ValueError:
+                        st.error(f"无法解析行: {line}")
+
 else:
     debug_event_id = None
-    debug_hours_input = None
+    debug_freeze_str = None
+    use_max_time = True
+    manual_points_raw = []
 
 # ==========================================
 # 4. 核心逻辑
@@ -154,10 +195,8 @@ if should_run:
             # 1. 获取目标 ID
             if enable_debug and debug_event_id:
                 target_eid = int(debug_event_id)
-                target_debug_h = float(debug_hours_input)
             else:
                 target_eid = ds.get_current_event_id()
-                target_debug_h = None
             
             if not target_eid:
                 st.error("无法获取当前活动 ID，请检查网络或手动指定。")
@@ -171,8 +210,109 @@ if should_run:
                     target_data = calculate_derived_columns(target_data)
                     target_data.full_df = target_data.df.copy() # 保存上帝视角副本
 
+                    # --- 时间解析与转换逻辑 ---
+                    start_ts = target_data.meta.start_at
+                    tz_utc8 = timezone(timedelta(hours=8))
+                    
+                    # A. 处理冻结时间
+                    target_debug_h = None
+                    if enable_debug and not use_max_time and debug_freeze_str:
+                        # 1. 尝试解析为纯数字 (相对小时)
+                        try:
+                            target_debug_h = float(debug_freeze_str)
+                        except ValueError:
+                            # 2. 尝试解析为 UTC+8 时间字符串
+                            try:
+                                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+                                    try:
+                                        dt_freeze = datetime.strptime(debug_freeze_str, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
+                                else:
+                                    raise ValueError("无法识别的时间格式")
+                                    
+                                dt_freeze = dt_freeze.replace(tzinfo=tz_utc8)
+                                ts_freeze = dt_freeze.timestamp() * 1000
+                                target_debug_h = (ts_freeze - start_ts) / 3600000.0
+                            except Exception as e:
+                                st.error(f"冻结时间解析失败: {e}，将使用最大观测时间")
+                                target_debug_h = None
+                        
+                        if target_debug_h is not None and target_debug_h < 0:
+                            st.warning("冻结时间早于活动开始时间，将使用 0.0 小时")
+                            target_debug_h = 0.0
+
+                    # B. 处理人工干预点
+                    manual_points = []
+                    if manual_points_raw:
+                        for mp in manual_points_raw:
+                            try:
+                                # 同样尝试解析时间
+                                t_str = mp['time_str']
+                                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+                                    try:
+                                        dt_mp = datetime.strptime(t_str, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
+                                else:
+                                    st.warning(f"跳过无法解析的时间: {t_str}")
+                                    continue
+                                
+                                dt_mp = dt_mp.replace(tzinfo=tz_utc8)
+                                ts_mp = dt_mp.timestamp() * 1000
+                                h_mp = (ts_mp - start_ts) / 3600000.0
+                                
+                                manual_points.append({'hours': h_mp, 'score': mp['score']})
+                            except Exception as e:
+                                st.warning(f"处理干预点出错: {mp} - {e}")
+
+                    # --- 异常输入检查 (仅警告) ---
+                    if manual_points:
+                        # 1. 检查时间范围
+                        total_h = target_data.meta.total_hours
+                        for mp in manual_points:
+                            if mp['hours'] < 0 or mp['hours'] > total_h:
+                                st.warning(f"⚠️ 警告: 干预点时间 {mp['hours']:.1f}h 超出活动范围 (0~{total_h}h)")
+                        
+                        # 2. 检查分数倒退 (负速度)
+                        # 需要结合当前最新数据
+                        current_max_score = target_data.df['value'].max()
+                        current_max_time = target_data.df['hours_elapsed'].max()
+                        
+                        # 按时间排序
+                        sorted_mps = sorted(manual_points, key=lambda x: x['hours'])
+                        
+                        last_s = current_max_score
+                        last_t = current_max_time
+                        
+                        for mp in sorted_mps:
+                            if mp['hours'] <= last_t:
+                                st.warning(f"⚠️ 警告: 干预点时间 {mp['hours']:.1f}h 早于或等于前一个点 ({last_t:.1f}h)，将被忽略")
+                                continue
+                                
+                            if mp['score'] < last_s:
+                                st.warning(f"⚠️ 警告: 干预点分数 {int(mp['score'])} 低于前一个点 ({int(last_s)})，意味着负增长")
+                            
+                            # 3. 检查超高速
+                            # 粗略计算一下平均速度
+                            delta_s = mp['score'] - last_s
+                            delta_t = mp['hours'] - last_t
+                            if delta_t > 0:
+                                speed_val = delta_s / delta_t
+                                # 归一化速度 > 1.0 意味着超过了理论最大速度 (scale)
+                                if target_data.scale > 0:
+                                    norm_spd = (speed_val / 60.0) / target_data.scale
+                                    if norm_spd > 1.0:
+                                        st.warning(f"⚠️ 警告: 干预区间速度超过理论极限 (Norm Speed ≈ {norm_spd:.2f} > 1.0)，请检查输入")
+
+                            last_s = mp['score']
+                            last_t = mp['hours']
+                    # ---------------------------
+
                     # 截断逻辑
-                    if target_debug_h:
+                    if target_debug_h is not None:
                         limit_ts = target_data.meta.start_at + (target_debug_h * 3600 * 1000)
                         target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()
 
@@ -199,10 +339,21 @@ if should_run:
                     visualizer = Visualizer()
 
                     # 5. 执行预测
-                    result = engine.predict(target_data, history_events, debug_hours=target_debug_h)
+                    result = engine.predict(
+                        target_data,
+                        history_events,
+                        debug_hours=target_debug_h,
+                        manual_points=manual_points
+                    )
 
                     # 6. 绘图 (内存操作)
-                    fig = visualizer.plot_prediction(target_data, result, debug_hours=target_debug_h, save=False)
+                    fig = visualizer.plot_prediction(
+                        target_data,
+                        result,
+                        debug_hours=target_debug_h,
+                        manual_points=manual_points,
+                        save=False
+                    )
                     
                     # 转 BytesIO
                     buf = BytesIO()
