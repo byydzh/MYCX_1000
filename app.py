@@ -37,7 +37,25 @@ def calculate_derived_columns(event_data: EventData) -> EventData:
     df = event_data.df
     event_data.clean_data()
     
-    # 简单的维护延迟修正逻辑 (简化版，仅用于计算)
+    # 维护延迟修复
+    original_start = event_data.meta.start_at
+    valid_points = df[df['value'] > 0]
+    if not valid_points.empty:
+        first_valid_ts = valid_points.iloc[0]['time']
+        # 限制修正范围在开服 24 小时内，避免误判
+        if first_valid_ts > original_start and (first_valid_ts - original_start) < 86400000:
+            from datetime import datetime, timezone
+            # 注意：这里假设 timestamp 是 UTC 时间戳
+            dt_first = datetime.fromtimestamp(first_valid_ts / 1000, timezone.utc)
+            # 向下取整到小时 (或者根据实际需求调整)
+            dt_corrected = dt_first.replace(minute=0, second=0, microsecond=0)
+            corrected_start = int(dt_corrected.timestamp() * 1000)
+            
+            if corrected_start > original_start:
+                # 在 Streamlit 里可以用 st.toast 或 print
+                # print(f"检测到维护延迟，修正 start_at")
+                event_data.meta.start_at = corrected_start
+
     start_ts = event_data.meta.start_at
     df['hours_elapsed'] = (df['time'] - start_ts) / 3600000.0
     
