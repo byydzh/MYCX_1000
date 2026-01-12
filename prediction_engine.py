@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Optional, Tuple
 import logging
+from scipy.optimize import minimize
 from datetime import datetime, timedelta, timezone
 
 from domain_models import EventData, PredictionResult
@@ -123,6 +124,59 @@ class PredictionEngine:
         if not hist_params:
             return np.array([0.05, 0.001, 0.0, 0.5, 24.0])
         return np.mean(hist_params, axis=0)
+
+    def _refit_shape_params(self, target: EventData, initial_params: np.ndarray) -> np.ndarray:
+        """
+        使用带正则化的最小二乘法，基于当前观测对形状参数 A 和 B 进行在线重拟合。
+        如果观测点不足则返回 initial_params 不变。
+        """
+        try:
+            if 'skeleton_speed' not in target.df.columns:
+                return initial_params
+
+            valid_mask = np.isfinite(target.df['skeleton_speed'])
+            if valid_mask.sum() < int(self.config.get('refit_min_points', 10)):
+                return initial_params
+
+            t_obs = target.df.loc[valid_mask, 'hours_elapsed'].values
+            v_obs = target.df.loc[valid_mask, 'skeleton_speed'].values
+
+            prior = initial_params.copy()
+            total_hours = target.meta.total_hours
+
+            # 自适应正则强度，依据观测量级和观测能量
+            lambda_reg = float(self.config.get('refit_lambda', 0.5)) * (np.mean(v_obs ** 2) + 1e-6)
+
+            def loss(x):
+                # x[0] -> A, x[1] -> B
+                tmp = prior.copy()
+                tmp[1] = float(x[0])
+                tmp[2] = float(x[1])
+
+                v_pred = self.modeler.shape_function(t_obs, *tmp, total_hours)
+                mse = np.mean((v_obs - v_pred) ** 2)
+
+                # 相对正则化，防止量级问题
+                reg_A = ((x[0] - prior[1]) ** 2) / (prior[1] ** 2 + 1e-9)
+                reg_B = ((x[1] - prior[2]) ** 2) / (prior[2] ** 2 + 1e-9)
+                return mse + lambda_reg * (reg_A + reg_B)
+
+            bounds = [(0.0, None), (0.0, None)]
+            x0 = [prior[1], prior[2]]
+            res = minimize(loss, x0=x0, bounds=bounds, method='L-BFGS-B')
+
+            if res.success:
+                new_params = prior.copy()
+                new_params[1] = float(res.x[0])
+                new_params[2] = float(res.x[1])
+                logger.info(f"Refit shape params: A {prior[1]:.5f}->{new_params[1]:.5f}, B {prior[2]:.6f}->{new_params[2]:.6f}")
+                return new_params
+            else:
+                return initial_params
+
+        except Exception as e:
+            logger.warning(f"_refit_shape_params failed: {e}")
+            return initial_params
 
     def _run_kalman_filter(self, times: np.ndarray, obs_scores: np.ndarray, 
                            model_speed_func, dt_step=1.0) -> Tuple[float, float]:
@@ -494,6 +548,18 @@ class PredictionEngine:
         pred_params[1] *= ratio        # A
         pred_params[2] *= ratio        # B
         pred_params[3] *= (ratio ** 1.1) # B_end
+
+        # --- 尝试用当前观测在线重拟合形状参数 (A, B)，并按置信度融合 ---
+        try:
+            target_params = self._refit_shape_params(target, pred_params)
+            if target_params is not None:
+                conf = float(np.clip(observed_hours / float(self.config.get('refit_conf_norm_hours', 24.0)), 0.0, 0.9))
+                # 当观测足够多时，优先使用观测拟合的参数
+                if conf > 0.0:
+                    logger.info(f"Blending shape params with weight={conf:.3f}")
+                    pred_params = (1.0 - conf) * pred_params + conf * target_params
+        except Exception as e:
+            logger.warning(f"Shape refit blend failed: {e}")
         
         # === 3.5 插入人工干预逻辑 ===
         # 如果有人工点，我们需要先生成“虚拟历史”，然后基于这个虚拟历史来做后续的 Scale 计算
