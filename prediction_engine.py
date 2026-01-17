@@ -320,7 +320,7 @@ class PredictionEngine:
             # 截断保护
             est_scale = np.clip(est_scale, 0.5, 3.0)
             # 限制 trend 的幅度，防止过拟合
-            est_trend = np.clip(est_trend, -0.05, 0.05) 
+            est_trend = np.clip(est_trend, -0.03, 0.05)
             
             # 构造 adjustment array
             scale_curve = np.ones_like(future_t) * est_scale
@@ -331,8 +331,8 @@ class PredictionEngine:
             # 对未来应用带阻尼的趋势
             if idx_now < len(future_t):
                 future_deltas = future_t[idx_now:] - current_max_time
-                # 阻尼系数：每过 12 小时，趋势影响力减半
-                decay_lambda = np.log(2) / 12.0 
+                # 阻尼系数：每过 2 小时，趋势影响力减半 (防止长期趋势过度外推导致 Scale 负值)
+                decay_lambda = np.log(2) / 2.0
                 
                 # 积分形式的阻尼： Trend * (1 - exp(-lambda * t)) / lambda ???
                 # 不，Scale 是速度的系数。Trend 是 Scale 的变化率。
@@ -342,6 +342,9 @@ class PredictionEngine:
                 
                 trend_impact = est_trend * (1.0 - np.exp(-decay_lambda * future_deltas)) / decay_lambda
                 scale_curve[idx_now:] += trend_impact
+            
+            # 强制非负保护 (Scale 必须 > 0.1)
+            scale_curve = np.maximum(scale_curve, 0.1)
                 
             # 对过去的部分（仅用于绘图或对齐），简单设为 est_scale
             # 实际计算积分时，过去的部分其实不重要，因为我们是基于 current_score 往后加

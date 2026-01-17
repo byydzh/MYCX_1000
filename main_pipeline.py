@@ -145,7 +145,16 @@ class PredictionPipeline:
         logger.info("流水线运行结束 喵！")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--event_id', '-e', type=int, help='Target Event ID')
+    parser.add_argument('--debug_hours', '-d', type=float, help='Debug hours limit')
+    args = parser.parse_args()
+
     pipeline = PredictionPipeline()
-    # 示例用法
-    pipeline.run()
-    # pipeline.run(target_event_id=289, debug_hours=80)
+    
+    if args.event_id:
+        pipeline.run(target_event_id=args.event_id, debug_hours=args.debug_hours)
+    else:
+        # 默认行为
+        pipeline.run()
