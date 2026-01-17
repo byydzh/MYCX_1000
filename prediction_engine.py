@@ -127,7 +127,7 @@ class PredictionEngine:
 
     def _refit_shape_params(self, target: EventData, initial_params: np.ndarray) -> np.ndarray:
         """
-        使用带正则化的最小二乘法，基于当前观测对形状参数 A 和 B 进行在线重拟合。
+        使用带正则化的最小二乘法，基于当前观测对形状参数 Base, A, B 进行在线重拟合。
         如果观测点不足则返回 initial_params 不变。
         """
         try:
@@ -145,31 +145,35 @@ class PredictionEngine:
             total_hours = target.meta.total_hours
 
             # 自适应正则强度，依据观测量级和观测能量
-            lambda_reg = float(self.config.get('refit_lambda', 0.5)) * (np.mean(v_obs ** 2) + 1e-6)
+            lambda_reg = float(self.config.get('refit_lambda', 0.3)) * (np.mean(v_obs ** 2) + 1e-6)
 
             def loss(x):
-                # x[0] -> A, x[1] -> B
+                # x[0] -> Base, x[1] -> A, x[2] -> B
                 tmp = prior.copy()
-                tmp[1] = float(x[0])
-                tmp[2] = float(x[1])
+                tmp[0] = float(x[0])
+                tmp[1] = float(x[1])
+                tmp[2] = float(x[2])
 
                 v_pred = self.modeler.shape_function(t_obs, *tmp, total_hours)
                 mse = np.mean((v_obs - v_pred) ** 2)
 
                 # 相对正则化，防止量级问题
-                reg_A = ((x[0] - prior[1]) ** 2) / (prior[1] ** 2 + 1e-9)
-                reg_B = ((x[1] - prior[2]) ** 2) / (prior[2] ** 2 + 1e-9)
-                return mse + lambda_reg * (reg_A + reg_B)
+                reg_Base = ((x[0] - prior[0]) ** 2) / (prior[0] ** 2 + 1e-9)
+                reg_A = ((x[1] - prior[1]) ** 2) / (prior[1] ** 2 + 1e-9)
+                reg_B = ((x[2] - prior[2]) ** 2) / (prior[2] ** 2 + 1e-9)
+                return mse + lambda_reg * (reg_Base + reg_A + reg_B)
 
-            bounds = [(0.0, None), (0.0, None)]
-            x0 = [prior[1], prior[2]]
+            # Base, A, B 均需非负
+            bounds = [(0.0, None), (0.0, None), (0.0, None)]
+            x0 = [prior[0], prior[1], prior[2]]
             res = minimize(loss, x0=x0, bounds=bounds, method='L-BFGS-B')
 
             if res.success:
                 new_params = prior.copy()
-                new_params[1] = float(res.x[0])
-                new_params[2] = float(res.x[1])
-                logger.info(f"Refit shape params: A {prior[1]:.5f}->{new_params[1]:.5f}, B {prior[2]:.6f}->{new_params[2]:.6f}")
+                new_params[0] = float(res.x[0])
+                new_params[1] = float(res.x[1])
+                new_params[2] = float(res.x[2])
+                logger.info(f"Refit params: Base {prior[0]:.4f}->{new_params[0]:.4f}, A {prior[1]:.5f}->{new_params[1]:.5f}, B {prior[2]:.6f}->{new_params[2]:.6f}")
                 return new_params
             else:
                 return initial_params
@@ -509,7 +513,11 @@ class PredictionEngine:
         t_start_cmp = float(self.config.get('t_start_cmp', 6.0))
         observed_hours = float(target.df['hours_elapsed'].max())
         end_source = debug_hours if debug_hours is not None else observed_hours
-        t_end_cmp = min(end_source, float(self.config.get('t_end_cap', 72.0)))
+        
+        # 动态调整对比上限：允许对比到活动结束前 24 小时，或者至少 72 小时
+        # 这样在活动后半段，Ratio 依然会随着新数据的进入而更新
+        dynamic_cap = max(float(self.config.get('t_end_cap', 72.0)), target.meta.total_hours - 24.0)
+        t_end_cmp = min(end_source, dynamic_cap)
         
         # 2. 计算 Ratio (基于真实数据)
         # 我们希望 Ratio 反映的是“该活动目前的自然强度”，而不是被人工干预后的强度

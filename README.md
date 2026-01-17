@@ -81,7 +81,7 @@ $$
 1) 全局形状缩放（`ratio`）——通过对比短期窗口内的骨架速率（`skeleton_speed`）与历史同类窗口的平均值计算得到：
 
 $$
-\mathrm{skeleton\_ratio}=\frac{I_{curr}}{\overline{I}_{hist}},\quad I=\text{mean skeleton speed in [t\_start,t\_end]}
+\mathrm{skeleton\_ratio}=\frac{I_{curr}}{\overline{I}_{hist}},\quad I=\text{mean skeleton speed in } [t_{start}, t_{end}]
 $$
 
 系统还计算基于 `norm_speed` 的归一化比（`norm_ratio`），并根据已观测时间占比 $s$ 对两者加权混合：
