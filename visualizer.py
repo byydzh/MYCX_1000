@@ -122,7 +122,7 @@ class Visualizer:
         ax1.axvline(x=now_dt, color='black', linestyle=':', label='Now')
         ax1.set_title(f"Event {target.meta.event_id} Speed Prediction")
         ax1.set_ylabel("Normalized Speed")
-        ax1.legend(loc='upper right')
+        ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(date_fmt)
 
