@@ -105,6 +105,19 @@ with st.sidebar.expander("参数设置", expanded=False):
     panic_scaler = st.slider("恐慌期最小加速倍数", 1.0, 3.0, DEFAULT_CONFIG.get('panic_scaler', 1.1), 0.05)
     panic_ease_power = st.slider("恐慌期缓动指数", 0.1, 5.0, DEFAULT_CONFIG.get('panic_ease_power', 1.0), 0.1)
     similar_count = st.number_input("参考历史活动数", 1, 10, DEFAULT_CONFIG.get('similar_count', 5))
+    
+    default_ignore = DEFAULT_CONFIG.get('ignore_event_ids', [])
+    ignore_ids_str = st.text_input(
+        "忽略的活动 ID (逗号分隔)",
+        value=", ".join(map(str, default_ignore)),
+        help="例如: 297, 298"
+    )
+    ignore_ids = []
+    if ignore_ids_str.strip():
+        try:
+            ignore_ids = [int(x.strip()) for x in ignore_ids_str.replace('，', ',').split(',') if x.strip()]
+        except ValueError:
+            st.sidebar.error("忽略 ID 格式错误，请使用逗号分隔的数字")
 
     # 阈值与限制
     st.markdown("**阈值与限制**")
@@ -336,7 +349,10 @@ if should_run:
 
                     # 3. 获取历史数据
                     similar_packs = ds.find_similar_events(
-                        target_eid, target_data.meta.event_type, count=int(similar_count)
+                        target_eid,
+                        target_data.meta.event_type,
+                        count=int(similar_count),
+                        ignore_ids=ignore_ids
                     )
                     history_events = []
                     for pack in similar_packs:
