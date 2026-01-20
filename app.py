@@ -104,6 +104,7 @@ with st.sidebar.expander("参数设置", expanded=False):
     weekend_mult = st.slider("周末增强系数", 0.8, 1.5, DEFAULT_CONFIG.get('weekend_multiplier', 1.0), 0.05)
     panic_scaler = st.slider("恐慌期最小加速倍数", 1.0, 3.0, DEFAULT_CONFIG.get('panic_scaler', 1.1), 0.05)
     panic_ease_power = st.slider("恐慌期缓动指数", 0.1, 5.0, DEFAULT_CONFIG.get('panic_ease_power', 1.0), 0.1)
+    refit_weight_scale = st.number_input("拟合权重系数 (Log Scale)", 1.0, 100.0, DEFAULT_CONFIG.get('refit_weight_scale', 10.0), 1.0)
     similar_count = st.number_input("参考历史活动数", 1, 10, DEFAULT_CONFIG.get('similar_count', 5))
     
     default_ignore = DEFAULT_CONFIG.get('ignore_event_ids', [])
@@ -211,6 +212,7 @@ if should_run:
         'weekend_multiplier': weekend_mult,
         'panic_scaler': panic_scaler,
         'panic_ease_power': panic_ease_power,
+        'refit_weight_scale': refit_weight_scale,
         'similar_count': int(similar_count),
         'ratio_min': ratio_min, 'ratio_max': ratio_max,
         'scale_min': scale_min, 'scale_max': scale_max,

@@ -30,4 +30,7 @@ DEFAULT_CONFIG = {
     'smooth_thresh1': 0.5,          # 第一阶段轻微衰减阈值 (50% 极速)
     'smooth_thresh2': 0.65,         # 第二阶段强力衰减阈值 (65% 极速)
     'smooth_hard_cap': 0.8,         # 绝对硬顶 (80% 极速，不可逾越之墙)
+
+    # --- 拟合权重参数 ---
+    'refit_weight_scale': 10.0,     # 对数加权系数 (log1p(x * scale))，越大则低值区权重越低
 }

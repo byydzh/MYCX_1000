@@ -141,6 +141,23 @@ class PredictionEngine:
             t_obs = target.df.loc[valid_mask, 'hours_elapsed'].values
             v_obs = target.df.loc[valid_mask, 'skeleton_speed'].values
 
+            # 权重计算 (Logarithmic Weighting)
+            # 目的：降低夜间低数据量（低 norm_speed）对拟合的影响，防止噪声被放大
+            # 使用 log1p(x * scale) 确保：
+            # 1. 极低值 (0.05) -> 权重小
+            # 2. 中高值 (0.5 - 1.0) -> 权重差异不大
+            weight_scale = float(self.config.get('refit_weight_scale', 10.0))
+            raw_obs = target.df.loc[valid_mask, 'norm_speed'].values
+            raw_obs = np.maximum(raw_obs, 0.0) # 保护非负
+            
+            weights = np.log1p(raw_obs * weight_scale)
+            
+            # 归一化权重，保持均值为 1.0，以免破坏正则化项的比例
+            if len(weights) > 0 and np.sum(weights) > 0:
+                weights = weights / np.mean(weights)
+            else:
+                weights = np.ones_like(v_obs)
+
             prior = initial_params.copy()
             total_hours = target.meta.total_hours
 
@@ -155,7 +172,9 @@ class PredictionEngine:
                 tmp[2] = float(x[2])
 
                 v_pred = self.modeler.shape_function(t_obs, *tmp, total_hours)
-                mse = np.mean((v_obs - v_pred) ** 2)
+                
+                # 使用加权 MSE
+                mse = np.mean(weights * (v_obs - v_pred) ** 2)
 
                 # 相对正则化，防止量级问题
                 reg_Base = ((x[0] - prior[0]) ** 2) / (prior[0] ** 2 + 1e-9)
