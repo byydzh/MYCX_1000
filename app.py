@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # 引入新架构的组件
-from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG
+from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG, list_models, list_presets, load_preset
 from data_source import create_data_source
 from domain_models import EventData, EventMeta
 from math_models import SeasonalityHandler, CosineModeler
@@ -73,6 +73,78 @@ def calculate_derived_columns(event_data: EventData) -> EventData:
     event_data.df = df
     return event_data
 
+
+MODEL_STATE_KEY = "selected_model"
+PRESET_STATE_KEY = "selected_preset"
+PRESET_SIGNATURE_KEY = "preset_applied_signature"
+IGNORE_IDS_TEXT_KEY = "cfg_ignore_event_ids_text"
+DEFAULT_PRESET_BY_MODEL = {
+    "skeleton_kf": "learned_notebook",
+}
+
+PRIMARY_CONFIG_KEYS = [
+    "api_source",
+    "weekend_multiplier",
+    "panic_scaler",
+    "panic_ease_power",
+    "refit_weight_scale",
+    "similar_count",
+    "ratio_min",
+    "ratio_max",
+    "scale_min",
+    "scale_max",
+    "t_start_cmp",
+    "t_end_cap",
+    "corr_min",
+    "corr_max",
+    "smooth_thresh1",
+    "smooth_thresh2",
+    "smooth_hard_cap",
+]
+
+ADVANCED_CONFIG_KEYS = [
+    "refit_min_points",
+    "refit_lambda",
+    "refit_start_hours",
+    "refit_recent_hours",
+    "refit_conf_norm_hours",
+    "refit_conf_max",
+    "refit_base_min_ratio",
+    "refit_base_max_ratio",
+    "refit_linear_bound_scale",
+    "refit_linear_zero_ratio",
+    "refit_quad_min_ratio",
+    "refit_quad_max_ratio",
+]
+
+
+def _config_state_key(param_name: str) -> str:
+    return f"cfg_{param_name}"
+
+
+def _format_ignore_ids(ignore_ids) -> str:
+    if not ignore_ids:
+        return ""
+    return ", ".join(str(int(item)) for item in ignore_ids)
+
+
+def _parse_ignore_ids(ignore_ids_str: str):
+    if not ignore_ids_str or not ignore_ids_str.strip():
+        return []
+    return [int(x.strip()) for x in ignore_ids_str.replace("，", ",").split(",") if x.strip()]
+
+
+def _apply_preset_to_session(model_id: str, preset_name: str) -> dict:
+    preset_config = load_preset(model_id, preset_name)
+    for key in PRIMARY_CONFIG_KEYS + ADVANCED_CONFIG_KEYS:
+        st.session_state[_config_state_key(key)] = preset_config.get(key, DEFAULT_CONFIG.get(key))
+
+    st.session_state[IGNORE_IDS_TEXT_KEY] = _format_ignore_ids(
+        preset_config.get("ignore_event_ids", DEFAULT_CONFIG.get("ignore_event_ids", []))
+    )
+    st.session_state[PRESET_SIGNATURE_KEY] = f"{model_id}:{preset_name}"
+    return preset_config
+
 # ==========================================
 # 1. 页面配置
 # ==========================================
@@ -88,46 +160,136 @@ if 'last_update_str' not in st.session_state:
     st.session_state['last_update_str'] = "暂无数据"
 if 'has_initialized' not in st.session_state:
     st.session_state['has_initialized'] = False
+if PRESET_SIGNATURE_KEY not in st.session_state:
+    st.session_state[PRESET_SIGNATURE_KEY] = None
 
 # ==========================================
 # 3. 侧边栏控制
 # ==========================================
 st.sidebar.header("控制台 🎮")
+
+available_models = list_models()
+if not available_models:
+    available_models = [{
+        "id": "skeleton_kf",
+        "name": "Skeleton + Kalman Filter",
+        "description": "Fallback model registry entry.",
+    }]
+
+model_options = [item["id"] for item in available_models]
+model_lookup = {item["id"]: item for item in available_models}
+if st.session_state.get(MODEL_STATE_KEY) not in model_options:
+    st.session_state[MODEL_STATE_KEY] = model_options[0]
+
+selected_model = st.sidebar.selectbox(
+    "预测模型",
+    options=model_options,
+    index=model_options.index(st.session_state[MODEL_STATE_KEY]),
+    format_func=lambda model_id: model_lookup[model_id].get("name", model_id),
+    key=MODEL_STATE_KEY,
+    disabled=len(model_options) <= 1,
+)
+selected_model_meta = model_lookup[selected_model]
+if selected_model_meta.get("description"):
+    st.sidebar.caption(selected_model_meta["description"])
+
+available_presets = list_presets(selected_model)
+if not available_presets:
+    available_presets = [{
+        "id": "default",
+        "name": "default",
+        "description": "Fallback to DEFAULT_CONFIG",
+    }]
+
+preset_options = [item["id"] for item in available_presets]
+preset_lookup = {item["id"]: item for item in available_presets}
+preferred_preset = DEFAULT_PRESET_BY_MODEL.get(selected_model, preset_options[0])
+if preferred_preset not in preset_options:
+    preferred_preset = preset_options[0]
+if st.session_state.get(PRESET_STATE_KEY) not in preset_options:
+    st.session_state[PRESET_STATE_KEY] = preferred_preset
+
+selected_preset = st.sidebar.selectbox(
+    "配置预设",
+    options=preset_options,
+    index=preset_options.index(st.session_state[PRESET_STATE_KEY]),
+    format_func=lambda preset_id: preset_lookup[preset_id].get("name", preset_id),
+    key=PRESET_STATE_KEY,
+)
+
+selected_preset_meta = preset_lookup[selected_preset]
+if selected_preset_meta.get("description"):
+    st.sidebar.caption(selected_preset_meta["description"])
+
+current_signature = f"{selected_model}:{selected_preset}"
+if st.session_state.get(PRESET_SIGNATURE_KEY) != current_signature:
+    _apply_preset_to_session(selected_model, selected_preset)
+
 manual_btn = st.sidebar.button("⚡ 立即运行预测", type="primary")
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("参数设置", expanded=False):
-    st.caption("调整下列参数将覆盖 config.py 的默认值")
+    st.caption("切换预设会重置下面控件；手动修改只影响当前会话，不会回写 JSON。")
 
     api_source_keys = list(API_SOURCE_CONFIGS.keys())
-    default_api_source = DEFAULT_CONFIG.get('api_source', api_source_keys[0])
-    default_api_index = api_source_keys.index(default_api_source) if default_api_source in api_source_keys else 0
+    selected_api_source_key = st.session_state.get(
+        _config_state_key('api_source'),
+        DEFAULT_CONFIG.get('api_source', api_source_keys[0])
+    )
+    if selected_api_source_key not in api_source_keys:
+        selected_api_source_key = api_source_keys[0]
     selected_api_source = st.selectbox(
         "API 数据源",
         options=api_source_keys,
-        index=default_api_index,
+        index=api_source_keys.index(selected_api_source_key),
         format_func=lambda key: API_SOURCE_CONFIGS[key].get('label', key),
-        help="切换活动元数据与榜线数据接口；HHWX 配置默认启用，T10 scale 仍会保留 Bestdori 兜底。"
+        help="切换活动元数据与榜线数据接口；HHWX 配置默认启用，T10 scale 仍会保留 Bestdori 兜底。",
+        key=_config_state_key('api_source'),
     )
     
     # 模型参数
     st.markdown("**模型参数**")
-    weekend_mult = st.slider("周末增强系数", 0.8, 1.5, DEFAULT_CONFIG.get('weekend_multiplier', 1.0), 0.05)
-    panic_scaler = st.slider("恐慌期最小加速倍数", 1.0, 3.0, DEFAULT_CONFIG.get('panic_scaler', 1.1), 0.05)
-    panic_ease_power = st.slider("恐慌期缓动指数", 0.1, 5.0, DEFAULT_CONFIG.get('panic_ease_power', 1.0), 0.1)
-    refit_weight_scale = st.number_input("拟合权重系数 (Log Scale)", 1.0, 100.0, DEFAULT_CONFIG.get('refit_weight_scale', 10.0), 1.0)
-    similar_count = st.number_input("参考历史活动数", 1, 10, DEFAULT_CONFIG.get('similar_count', 5))
+    weekend_mult = st.slider(
+        "周末增强系数", 0.8, 1.5,
+        value=float(st.session_state.get(_config_state_key('weekend_multiplier'), DEFAULT_CONFIG.get('weekend_multiplier', 1.0))),
+        step=0.05,
+        key=_config_state_key('weekend_multiplier')
+    )
+    panic_scaler = st.slider(
+        "恐慌期最小加速倍数", 1.0, 3.0,
+        value=float(st.session_state.get(_config_state_key('panic_scaler'), DEFAULT_CONFIG.get('panic_scaler', 1.1))),
+        step=0.05,
+        key=_config_state_key('panic_scaler')
+    )
+    panic_ease_power = st.slider(
+        "恐慌期缓动指数", 0.1, 5.0,
+        value=float(st.session_state.get(_config_state_key('panic_ease_power'), DEFAULT_CONFIG.get('panic_ease_power', 1.0))),
+        step=0.1,
+        key=_config_state_key('panic_ease_power')
+    )
+    refit_weight_scale = st.number_input(
+        "拟合权重系数 (Log Scale)", 1.0, 100.0,
+        value=float(st.session_state.get(_config_state_key('refit_weight_scale'), DEFAULT_CONFIG.get('refit_weight_scale', 10.0))),
+        step=1.0,
+        key=_config_state_key('refit_weight_scale')
+    )
+    similar_count = st.number_input(
+        "参考历史活动数", 1, 10,
+        value=int(st.session_state.get(_config_state_key('similar_count'), DEFAULT_CONFIG.get('similar_count', 5))),
+        step=1,
+        key=_config_state_key('similar_count')
+    )
     
-    default_ignore = DEFAULT_CONFIG.get('ignore_event_ids', [])
     ignore_ids_str = st.text_input(
         "忽略的活动 ID (逗号分隔)",
-        value=", ".join(map(str, default_ignore)),
-        help="例如: 297, 298"
+        value=st.session_state.get(IGNORE_IDS_TEXT_KEY, _format_ignore_ids(DEFAULT_CONFIG.get('ignore_event_ids', []))),
+        help="例如: 297, 298",
+        key=IGNORE_IDS_TEXT_KEY
     )
     ignore_ids = []
     if ignore_ids_str.strip():
         try:
-            ignore_ids = [int(x.strip()) for x in ignore_ids_str.replace('，', ',').split(',') if x.strip()]
+            ignore_ids = _parse_ignore_ids(ignore_ids_str)
         except ValueError:
             st.sidebar.error("忽略 ID 格式错误，请使用逗号分隔的数字")
 
@@ -135,21 +297,156 @@ with st.sidebar.expander("参数设置", expanded=False):
     st.markdown("**阈值与限制**")
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        ratio_min = st.number_input("Ratio Min", value=DEFAULT_CONFIG.get('ratio_min', 0.25), step=0.05)
-        scale_min = st.number_input("Scale Min", value=DEFAULT_CONFIG.get('scale_min', 0.5), step=0.1)
-        t_start_cmp = st.number_input("对比窗口起始", value=DEFAULT_CONFIG.get('t_start_cmp', 6.0), step=0.5)
+        ratio_min = st.number_input(
+            "Ratio Min",
+            value=float(st.session_state.get(_config_state_key('ratio_min'), DEFAULT_CONFIG.get('ratio_min', 0.25))),
+            step=0.05,
+            key=_config_state_key('ratio_min')
+        )
+        scale_min = st.number_input(
+            "Scale Min",
+            value=float(st.session_state.get(_config_state_key('scale_min'), DEFAULT_CONFIG.get('scale_min', 0.5))),
+            step=0.1,
+            key=_config_state_key('scale_min')
+        )
+        t_start_cmp = st.number_input(
+            "对比窗口起始",
+            value=float(st.session_state.get(_config_state_key('t_start_cmp'), DEFAULT_CONFIG.get('t_start_cmp', 6.0))),
+            step=0.5,
+            key=_config_state_key('t_start_cmp')
+        )
     with col_p2:
-        ratio_max = st.number_input("Ratio Max", value=DEFAULT_CONFIG.get('ratio_max', 4.0), step=0.1)
-        scale_max = st.number_input("Scale Max", value=DEFAULT_CONFIG.get('scale_max', 2.0), step=0.1)
-        t_end_cap = st.number_input("窗口结束上限", value=DEFAULT_CONFIG.get('t_end_cap', 72.0), step=1.0)
+        ratio_max = st.number_input(
+            "Ratio Max",
+            value=float(st.session_state.get(_config_state_key('ratio_max'), DEFAULT_CONFIG.get('ratio_max', 4.0))),
+            step=0.1,
+            key=_config_state_key('ratio_max')
+        )
+        scale_max = st.number_input(
+            "Scale Max",
+            value=float(st.session_state.get(_config_state_key('scale_max'), DEFAULT_CONFIG.get('scale_max', 2.0))),
+            step=0.1,
+            key=_config_state_key('scale_max')
+        )
+        t_end_cap = st.number_input(
+            "窗口结束上限",
+            value=float(st.session_state.get(_config_state_key('t_end_cap'), DEFAULT_CONFIG.get('t_end_cap', 72.0))),
+            step=1.0,
+            key=_config_state_key('t_end_cap')
+        )
 
     # 回测与平滑
     st.markdown("**回测与平滑**")
-    corr_min = st.number_input("24h 修正下限", value=DEFAULT_CONFIG.get('corr_min', 0.6), step=0.05)
-    corr_max = st.number_input("24h 修正上限", value=DEFAULT_CONFIG.get('corr_max', 1.6), step=0.05)
-    smooth_thresh1 = st.number_input("平滑阈值 1", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_thresh1', 0.5), 0.01)
-    smooth_thresh2 = st.number_input("平滑阈值 2", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_thresh2', 0.65), 0.01)
-    smooth_hard_cap = st.number_input("绝对硬顶", 0.0, 1.0, DEFAULT_CONFIG.get('smooth_hard_cap', 0.8), 0.01)
+    corr_min = st.number_input(
+        "24h 修正下限",
+        value=float(st.session_state.get(_config_state_key('corr_min'), DEFAULT_CONFIG.get('corr_min', 0.6))),
+        step=0.05,
+        key=_config_state_key('corr_min')
+    )
+    corr_max = st.number_input(
+        "24h 修正上限",
+        value=float(st.session_state.get(_config_state_key('corr_max'), DEFAULT_CONFIG.get('corr_max', 1.6))),
+        step=0.05,
+        key=_config_state_key('corr_max')
+    )
+    smooth_thresh1 = st.number_input(
+        "平滑阈值 1", 0.0, 1.0,
+        value=float(st.session_state.get(_config_state_key('smooth_thresh1'), DEFAULT_CONFIG.get('smooth_thresh1', 0.5))),
+        step=0.01,
+        key=_config_state_key('smooth_thresh1')
+    )
+    smooth_thresh2 = st.number_input(
+        "平滑阈值 2", 0.0, 1.0,
+        value=float(st.session_state.get(_config_state_key('smooth_thresh2'), DEFAULT_CONFIG.get('smooth_thresh2', 0.65))),
+        step=0.01,
+        key=_config_state_key('smooth_thresh2')
+    )
+    smooth_hard_cap = st.number_input(
+        "绝对硬顶", 0.0, 1.0,
+        value=float(st.session_state.get(_config_state_key('smooth_hard_cap'), DEFAULT_CONFIG.get('smooth_hard_cap', 0.8))),
+        step=0.01,
+        key=_config_state_key('smooth_hard_cap')
+    )
+
+with st.sidebar.expander("高级参数", expanded=False):
+    st.caption("当前主要开放在线重拟合相关参数，便于 preset 覆盖和精细微调。")
+
+    refit_min_points = st.number_input(
+        "Refit 最少点数", 1, 100,
+        value=int(st.session_state.get(_config_state_key('refit_min_points'), DEFAULT_CONFIG.get('refit_min_points', 10))),
+        step=1,
+        key=_config_state_key('refit_min_points')
+    )
+    refit_lambda = st.number_input(
+        "Refit 正则强度",
+        value=float(st.session_state.get(_config_state_key('refit_lambda'), DEFAULT_CONFIG.get('refit_lambda', 0.3))),
+        step=0.05,
+        key=_config_state_key('refit_lambda')
+    )
+
+    col_refit_1, col_refit_2 = st.columns(2)
+    with col_refit_1:
+        refit_start_hours = st.number_input(
+            "Refit 起始小时",
+            value=float(st.session_state.get(_config_state_key('refit_start_hours'), DEFAULT_CONFIG.get('refit_start_hours', 6.0))),
+            step=0.5,
+            key=_config_state_key('refit_start_hours')
+        )
+        refit_conf_norm_hours = st.number_input(
+            "置信度归一化时长",
+            value=float(st.session_state.get(_config_state_key('refit_conf_norm_hours'), DEFAULT_CONFIG.get('refit_conf_norm_hours', 72.0))),
+            step=1.0,
+            key=_config_state_key('refit_conf_norm_hours')
+        )
+        refit_base_min_ratio = st.number_input(
+            "Base 下界比例",
+            value=float(st.session_state.get(_config_state_key('refit_base_min_ratio'), DEFAULT_CONFIG.get('refit_base_min_ratio', 0.6))),
+            step=0.05,
+            key=_config_state_key('refit_base_min_ratio')
+        )
+        refit_linear_bound_scale = st.number_input(
+            "A 边界缩放",
+            value=float(st.session_state.get(_config_state_key('refit_linear_bound_scale'), DEFAULT_CONFIG.get('refit_linear_bound_scale', 2.0))),
+            step=0.05,
+            key=_config_state_key('refit_linear_bound_scale')
+        )
+        refit_quad_min_ratio = st.number_input(
+            "B 下界比例",
+            value=float(st.session_state.get(_config_state_key('refit_quad_min_ratio'), DEFAULT_CONFIG.get('refit_quad_min_ratio', 0.1))),
+            step=0.05,
+            key=_config_state_key('refit_quad_min_ratio')
+        )
+    with col_refit_2:
+        refit_recent_hours = st.number_input(
+            "Refit 最近窗口",
+            value=float(st.session_state.get(_config_state_key('refit_recent_hours'), DEFAULT_CONFIG.get('refit_recent_hours', 48.0))),
+            step=1.0,
+            key=_config_state_key('refit_recent_hours')
+        )
+        refit_conf_max = st.number_input(
+            "Refit 最大权重",
+            value=float(st.session_state.get(_config_state_key('refit_conf_max'), DEFAULT_CONFIG.get('refit_conf_max', 0.35))),
+            step=0.01,
+            key=_config_state_key('refit_conf_max')
+        )
+        refit_base_max_ratio = st.number_input(
+            "Base 上界比例",
+            value=float(st.session_state.get(_config_state_key('refit_base_max_ratio'), DEFAULT_CONFIG.get('refit_base_max_ratio', 1.6))),
+            step=0.05,
+            key=_config_state_key('refit_base_max_ratio')
+        )
+        refit_linear_zero_ratio = st.number_input(
+            "A 向零收缩比例",
+            value=float(st.session_state.get(_config_state_key('refit_linear_zero_ratio'), DEFAULT_CONFIG.get('refit_linear_zero_ratio', 0.25))),
+            step=0.05,
+            key=_config_state_key('refit_linear_zero_ratio')
+        )
+        refit_quad_max_ratio = st.number_input(
+            "B 上界比例",
+            value=float(st.session_state.get(_config_state_key('refit_quad_max_ratio'), DEFAULT_CONFIG.get('refit_quad_max_ratio', 2.0))),
+            step=0.05,
+            key=_config_state_key('refit_quad_max_ratio')
+        )
 
 # 调试模式
 st.sidebar.markdown("---")
@@ -218,7 +515,7 @@ elif not st.session_state['has_initialized']:
 
 if should_run:
     # 构造本次运行的配置字典
-    current_config = DEFAULT_CONFIG.copy()
+    current_config = load_preset(selected_model, selected_preset)
     current_config.update({
         'api_source': selected_api_source,
         'weekend_multiplier': weekend_mult,
@@ -226,12 +523,25 @@ if should_run:
         'panic_ease_power': panic_ease_power,
         'refit_weight_scale': refit_weight_scale,
         'similar_count': int(similar_count),
+        'ignore_event_ids': ignore_ids,
         'ratio_min': ratio_min, 'ratio_max': ratio_max,
         'scale_min': scale_min, 'scale_max': scale_max,
         't_start_cmp': t_start_cmp, 't_end_cap': t_end_cap,
         'corr_min': corr_min, 'corr_max': corr_max,
         'smooth_thresh1': smooth_thresh1, 'smooth_thresh2': smooth_thresh2,
-        'smooth_hard_cap': smooth_hard_cap
+        'smooth_hard_cap': smooth_hard_cap,
+        'refit_min_points': int(refit_min_points),
+        'refit_lambda': refit_lambda,
+        'refit_start_hours': refit_start_hours,
+        'refit_recent_hours': refit_recent_hours,
+        'refit_conf_norm_hours': refit_conf_norm_hours,
+        'refit_conf_max': refit_conf_max,
+        'refit_base_min_ratio': refit_base_min_ratio,
+        'refit_base_max_ratio': refit_base_max_ratio,
+        'refit_linear_bound_scale': refit_linear_bound_scale,
+        'refit_linear_zero_ratio': refit_linear_zero_ratio,
+        'refit_quad_min_ratio': refit_quad_min_ratio,
+        'refit_quad_max_ratio': refit_quad_max_ratio,
     })
 
     with st.spinner(f"🐱 ({trigger_reason}) 正在计算中..."):
@@ -365,8 +675,8 @@ if should_run:
                     similar_packs = ds.find_similar_events(
                         target_eid,
                         target_data.meta.event_type,
-                        count=int(similar_count),
-                        ignore_ids=ignore_ids
+                        count=int(current_config.get('similar_count', similar_count)),
+                        ignore_ids=current_config.get('ignore_event_ids', ignore_ids)
                     )
                     history_events = []
                     for pack in similar_packs:
@@ -378,9 +688,9 @@ if should_run:
                     
                     # 4. 初始化引擎组件
                     seasonality = SeasonalityHandler(
-                        weekend_multiplier=float(weekend_mult),
-                        panic_scaler=float(panic_scaler),
-                        panic_ease_power=float(panic_ease_power)
+                        weekend_multiplier=float(current_config.get('weekend_multiplier', weekend_mult)),
+                        panic_scaler=float(current_config.get('panic_scaler', panic_scaler)),
+                        panic_ease_power=float(current_config.get('panic_ease_power', panic_ease_power))
                     )
                     modeler = CosineModeler()
                     engine = PredictionEngine(seasonality, modeler, config=current_config)

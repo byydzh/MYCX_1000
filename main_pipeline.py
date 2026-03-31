@@ -22,7 +22,9 @@ logger = logging.getLogger('pipeline')
 
 class PredictionPipeline:
     def __init__(self, config=None):
-        self.config = config or DEFAULT_CONFIG
+        self.config = DEFAULT_CONFIG.copy()
+        if config:
+            self.config.update(config)
         self.data_source = create_data_source(self.config.get('api_source'))
         
         self.seasonality = SeasonalityHandler(

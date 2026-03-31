@@ -9,6 +9,7 @@
 !base_distribution.py
 !app.py
 !config.py
+!config_learning.py
 !base_speed_distribution.json
 !README.md
 !requirements.txt
@@ -23,3 +24,10 @@
 !math_models.py
 !visualizer.py
 !main_pipeline.py
+!tuner
+!tuner/*.py
+!tuner/*.ipynb
+
+# Config presets
+!configs
+!configs/**

@@ -5,10 +5,14 @@ import time
 import json
 from datetime import datetime, timedelta
 import os
-from chinese_calendar import is_workday
 from io import BytesIO
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+try:
+    from chinese_calendar import is_workday
+except ImportError:
+    is_workday = None
 
 # Module-level session to enable connection reuse and avoid FD leaks
 HTTP_SESSION = requests.Session()

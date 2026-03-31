@@ -24,7 +24,9 @@ class PredictionEngine:
     def __init__(self, seasonality_handler, modeler, config: dict = None):
         self.seasonality = seasonality_handler
         self.modeler = modeler
-        self.config = config or DEFAULT_CONFIG
+        self.config = DEFAULT_CONFIG.copy()
+        if config:
+            self.config.update(config)
 
     def _get_refit_frame(self, target: EventData) -> pd.DataFrame:
         """为在线 refit 选择更稳健的观测窗口。"""
@@ -116,6 +118,127 @@ class PredictionEngine:
                 return clean_slice.mean()
         return mean_val
 
+    def _get_window_mean(self, df: pd.DataFrame, column: str, t_start: float, t_end: float) -> Optional[float]:
+        """计算指定时间窗口内某列的均值。"""
+        if column not in df.columns:
+            return None
+
+        mask = (
+            (df['hours_elapsed'] >= t_start) &
+            (df['hours_elapsed'] <= t_end) &
+            np.isfinite(df[column])
+        )
+        data_slice = df.loc[mask, column]
+        if len(data_slice) == 0:
+            return None
+        return float(data_slice.mean())
+
+    def _get_duration_mismatch_weight(self, source_hours: float, reference_hours: float, max_weight_key: str) -> float:
+        """基于时长比的对数差异，输出一个平滑、对称的校正权重。"""
+        if source_hours <= 0 or reference_hours <= 0:
+            return 0.0
+
+        full_weight_gap = float(self.config.get('duration_align_log_full_weight', 0.18))
+        max_weight = float(self.config.get(max_weight_key, 0.75))
+        if full_weight_gap <= 0 or max_weight <= 0:
+            return 0.0
+
+        log_gap = abs(float(np.log(max(source_hours, 1e-9) / max(reference_hours, 1e-9))))
+        normalized_gap = min(log_gap / full_weight_gap, 1.0)
+        return float(np.clip(normalized_gap * max_weight, 0.0, max_weight))
+
+    def _map_window_by_progress(
+        self,
+        t_start: float,
+        t_end: float,
+        source_total_hours: float,
+        target_total_hours: float,
+    ) -> Tuple[float, float]:
+        """把 source 活动上的绝对小时窗口映射到 target 活动的相对进度窗口。"""
+        if source_total_hours <= 0 or target_total_hours <= 0:
+            return float(t_start), float(t_end)
+
+        start_progress = np.clip(float(t_start) / source_total_hours, 0.0, 1.0)
+        end_progress = np.clip(float(t_end) / source_total_hours, 0.0, 1.0)
+        mapped_start = float(start_progress * target_total_hours)
+        mapped_end = float(end_progress * target_total_hours)
+        return mapped_start, max(mapped_start, mapped_end)
+
+    def _get_history_window_stats(
+        self,
+        history_event: EventData,
+        target_total_hours: float,
+        t_start: float,
+        t_end: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """对历史活动同时计算绝对时间窗口和进度窗口，并按时长差异平滑混合。"""
+        hist_total_hours = float(history_event.meta.total_hours)
+        align_weight = self._get_duration_mismatch_weight(
+            target_total_hours,
+            hist_total_hours,
+            max_weight_key='duration_window_align_max_weight',
+        )
+
+        abs_intensity = self._get_window_intensity(history_event.df, t_start, t_end)
+        abs_norm_mean = self._get_window_mean(history_event.df, 'norm_speed', t_start, t_end)
+        if align_weight <= 0.0:
+            return abs_intensity, abs_norm_mean
+
+        mapped_start, mapped_end = self._map_window_by_progress(
+            t_start,
+            t_end,
+            target_total_hours,
+            hist_total_hours,
+        )
+        progress_intensity = self._get_window_intensity(history_event.df, mapped_start, mapped_end)
+        progress_norm_mean = self._get_window_mean(history_event.df, 'norm_speed', mapped_start, mapped_end)
+
+        blended_intensity = abs_intensity
+        if abs_intensity is None:
+            blended_intensity = progress_intensity
+        elif progress_intensity is not None:
+            blended_intensity = ((1.0 - align_weight) * abs_intensity) + (align_weight * progress_intensity)
+
+        blended_norm_mean = abs_norm_mean
+        if abs_norm_mean is None:
+            blended_norm_mean = progress_norm_mean
+        elif progress_norm_mean is not None:
+            blended_norm_mean = ((1.0 - align_weight) * abs_norm_mean) + (align_weight * progress_norm_mean)
+
+        return blended_intensity, blended_norm_mean
+
+    def _apply_duration_param_alignment(self, pred_params: np.ndarray, target: EventData, history: List[EventData]) -> np.ndarray:
+        """按连续权重对 A/B 做时长归一，避免只有时长差很大时才触发。"""
+        hist_durations = [h.meta.total_hours for h in history if h.meta.total_hours > 0]
+        avg_hist_duration = np.mean(hist_durations) if hist_durations else 0.0
+        target_duration = float(target.meta.total_hours)
+        if avg_hist_duration <= 0 or target_duration <= 0:
+            return pred_params
+
+        align_weight = self._get_duration_mismatch_weight(
+            target_duration,
+            avg_hist_duration,
+            max_weight_key='duration_param_align_max_weight',
+        )
+        if align_weight <= 0.0:
+            return pred_params
+
+        len_ratio = target_duration / avg_hist_duration
+        effective_len_ratio = float(np.exp(np.log(max(len_ratio, 1e-9)) * align_weight))
+        adjusted = pred_params.copy()
+        adjusted[1] /= effective_len_ratio
+        adjusted[2] /= (effective_len_ratio ** 2.0)
+
+        logger.debug(
+            "检测到时长差异 (Target: %.1fh vs Hist: %.1fh), 连续时长归一 ratio=%.3f weight=%.3f effective=%.3f",
+            target_duration,
+            avg_hist_duration,
+            len_ratio,
+            align_weight,
+            effective_len_ratio,
+        )
+        return adjusted
+
     def _calculate_ratio(self, target: EventData, history: List[EventData], 
                          t_start: float, t_end: float) -> float:
         """计算当前活动相对于历史活动的强度比率 (Ratio)。"""
@@ -124,26 +247,29 @@ class PredictionEngine:
         if curr_intensity is None:
             logger.warning("当前活动在对比区间内无有效数据，Ratio 默认为 1.0")
             return 1.0
+        target_total_hours = float(target.meta.total_hours)
 
         # 2. 计算历史平均强度
         hist_intensities = []
         hist_norms = []
         
         # 辅助校验：观测 Norm Speed 均值
-        mask_cmp = (target.df['hours_elapsed'] >= t_start) & (target.df['hours_elapsed'] <= t_end)
-        obs_norm_mean = target.df.loc[mask_cmp, 'norm_speed'].mean() if mask_cmp.any() else 0
+        obs_norm_mean = self._get_window_mean(target.df, 'norm_speed', t_start, t_end) or 0.0
 
         for h in history:
             if 'skeleton_speed' not in h.df.columns:
                 h.df = self.seasonality.remove_seasonality(h.df)
             
-            h_int = self._get_window_intensity(h.df, t_start, t_end)
+            h_int, h_norm_mean = self._get_history_window_stats(
+                h,
+                target_total_hours=target_total_hours,
+                t_start=t_start,
+                t_end=t_end,
+            )
             if h_int is not None:
                 hist_intensities.append(h_int)
-                
-            mask_h = (h.df['hours_elapsed'] >= t_start) & (h.df['hours_elapsed'] <= t_end)
-            if mask_h.any():
-                hist_norms.append(h.df.loc[mask_h, 'norm_speed'].mean())
+            if h_norm_mean is not None:
+                hist_norms.append(h_norm_mean)
 
         if not hist_intensities:
             logger.warning("没有有效的历史对比数据，Ratio 默认为 1.0")
@@ -160,9 +286,9 @@ class PredictionEngine:
                 norm_ratio = obs_norm_mean / mean_hist_norm
 
         # 4. 混合逻辑
-        target_total_hours = float(self.config.get('t_end_cap', 72.0))
+        ratio_blend_total_hours = float(self.config.get('t_end_cap', 72.0))
         observed_hours = float(target.df['hours_elapsed'].max())
-        s = np.clip(observed_hours / target_total_hours, 0.0, 1.0)
+        s = np.clip(observed_hours / ratio_blend_total_hours, 0.0, 1.0)
         
         w_norm = 0.2 + 0.6 * np.cos(s * np.pi - np.pi)
         w_norm = float(np.clip(w_norm, 0.0, 1.0))
@@ -261,7 +387,7 @@ class PredictionEngine:
                 new_params[0] = float(res.x[0])
                 new_params[1] = float(res.x[1])
                 new_params[2] = float(res.x[2])
-                logger.info(
+                logger.debug(
                     "Refit params: Base %.4f->%.4f, A %.5f->%.5f, B %.6f->%.6f | window=%d pts",
                     prior[0], new_params[0], prior[1], new_params[1], prior[2], new_params[2], len(refit_df)
                 )
@@ -284,13 +410,25 @@ class PredictionEngine:
         x = np.array([[1.0], [0.0]])
         
         # 状态协方差 P (初始不确定性)
-        P = np.array([[0.5, 0], [0, 0.01]])
+        dt_step = float(self.config.get('kf_dt_step', dt_step))
+        init_p_scale = float(self.config.get('kf_init_P_scale', 0.5))
+        init_p_trend = float(self.config.get('kf_init_P_trend', 0.01))
+        q_scale = float(self.config.get('kf_Q_scale', 1e-5))
+        q_trend = float(self.config.get('kf_Q_trend', 1e-7))
+        min_delta_model = float(self.config.get('kf_min_delta_model', 50.0))
+        z_clip_min = float(self.config.get('kf_z_clip_min', 0.1))
+        z_clip_max = float(self.config.get('kf_z_clip_max', 5.0))
+        base_r = float(self.config.get('kf_base_R', 0.1))
+        clip_penalty = float(self.config.get('kf_clip_penalty', 100.0))
+        adaptive_r_numerator = float(self.config.get('kf_adaptive_R_numerator', 2000.0))
+
+        P = np.array([[init_p_scale, 0], [0, init_p_trend]])
         
         # 状态转移矩阵 F
         F = np.array([[1.0, dt_step], [0.0, 1.0]])
         
         # 过程噪声 Q
-        Q = np.array([[1e-5, 0], [0, 1e-7]]) 
+        Q = np.array([[q_scale, 0], [0, q_trend]]) 
         
         # 测量矩阵 H
         H = np.array([[1.0, 0.0]])
@@ -321,20 +459,19 @@ class PredictionEngine:
             
             # --- C. 更新步骤 (Update) ---
             # 只有当模型预测有显著增量时，观测才有效
-            if delta_model > 50.0: 
+            if delta_model > min_delta_model: 
                 raw_z = delta_obs / delta_model
                 
                 # 观测值硬截断
-                z_val = np.clip(raw_z, 0.1, 5.0)
+                z_val = np.clip(raw_z, z_clip_min, z_clip_max)
                 z = np.array([[z_val]])
                 
                 # 动态调整测量噪声 R
                 penalty = 0.0
                 if abs(raw_z - z_val) > 0.1:
-                    penalty = 100.0 
+                    penalty = clip_penalty 
                 
-                base_R = 0.1
-                adaptive_R = base_R + (2000.0 / (delta_model + 1.0)) * 0.01 + penalty
+                adaptive_R = base_r + (adaptive_r_numerator / (delta_model + 1.0)) * 0.01 + penalty
                 R = np.array([[adaptive_R]])
                 
                 # 卡尔曼增益 K
@@ -401,7 +538,7 @@ class PredictionEngine:
             # 3. 运行 KF
             est_scale, est_trend = self._run_kalman_filter(kf_times, kf_scores, get_model_speed, dt_step=1.0)
             
-            logger.info(f"Kalman Filter Result: Scale={est_scale:.4f}, Trend={est_trend:.6f}/hr")
+            logger.debug(f"Kalman Filter Result: Scale={est_scale:.4f}, Trend={est_trend:.6f}/hr")
             
             # 4. 构造未来的 Scale 曲线
             # 我们不希望 Trend 无限延伸，因此应用衰减
@@ -409,9 +546,17 @@ class PredictionEngine:
             # 或者简单点：让 Trend 线性衰减到 0
             
             # 截断保护
-            est_scale = np.clip(est_scale, 0.5, 3.0)
+            est_scale = np.clip(
+                est_scale,
+                float(self.config.get('kf_scale_clip_min', 0.5)),
+                float(self.config.get('kf_scale_clip_max', 3.0)),
+            )
             # 限制 trend 的幅度，防止过拟合
-            est_trend = np.clip(est_trend, -0.03, 0.05)
+            est_trend = np.clip(
+                est_trend,
+                float(self.config.get('kf_trend_clip_min', -0.03)),
+                float(self.config.get('kf_trend_clip_max', 0.05)),
+            )
             
             # 构造 adjustment array
             scale_curve = np.ones_like(future_t) * est_scale
@@ -423,7 +568,8 @@ class PredictionEngine:
             if idx_now < len(future_t):
                 future_deltas = future_t[idx_now:] - current_max_time
                 # 阻尼系数：每过 2 小时，趋势影响力减半 (防止长期趋势过度外推导致 Scale 负值)
-                decay_lambda = np.log(2) / 2.0
+                half_life_hours = max(float(self.config.get('kf_trend_half_life_hours', 2.0)), 1e-6)
+                decay_lambda = np.log(2) / half_life_hours
                 
                 # 积分形式的阻尼： Trend * (1 - exp(-lambda * t)) / lambda ???
                 # 不，Scale 是速度的系数。Trend 是 Scale 的变化率。
@@ -616,35 +762,12 @@ class PredictionEngine:
         # 2. 计算 Ratio (基于真实数据)
         # 我们希望 Ratio 反映的是“该活动目前的自然强度”，而不是被人工干预后的强度
         ratio = self._calculate_ratio(target, history, t_start_cmp, t_end_cmp)
-        logger.info(f"Calculated Ratio: {ratio:.4f}")
+        logger.debug(f"Calculated Ratio: {ratio:.4f}")
 
         # 3. 获取并修正参数
         avg_params = self._fit_history_params(history)
         pred_params = avg_params.copy()
-        
-        # === 时长归一化修正 (Time-Scale Normalization) ===
-        # 计算历史活动的平均时长
-        hist_durations = [h.meta.total_hours for h in history if h.meta.total_hours > 0]
-        avg_hist_duration = np.mean(hist_durations) if hist_durations else 192.0 # 默认8天
-        target_duration = target.meta.total_hours
-        
-        # 计算时长倍率 (Scale Length)
-        # 如果当前活动比历史长，len_ratio > 1.0
-        len_ratio = target_duration / avg_hist_duration if avg_hist_duration > 0 else 1.0
-        
-        # if len_ratio > 1.1 or len_ratio < 0.9:
-        if len_ratio > 1.15:
-            logger.info(f"检测到时长差异 (Target: {target_duration:.1f}h vs Hist: {avg_hist_duration:.1f}h), "
-                        f"应用参数稀释: ratio={len_ratio:.2f}")
-            
-            # 修正线性项 A: V ~ A*t -> 为了保持 V 不变，A 需除以 len_ratio
-            pred_params[1] /= len_ratio
-            
-            # 修正二次项 B: V ~ B*t^2 -> 为了保持 V 不变，B 需除以 len_ratio^2
-            pred_params[2] /= (len_ratio ** 2.0)
-            
-            # 恐慌点 B_end 通常与时长关系不大
-        # =======================================================
+        pred_params = self._apply_duration_param_alignment(pred_params, target, history)
 
         pred_params[0] *= ratio        # Base
         pred_params[1] *= ratio        # A
@@ -658,7 +781,7 @@ class PredictionEngine:
                 conf = self._get_refit_confidence(target)
                 # 当观测足够多时，优先使用观测拟合的参数
                 if conf > 0.0:
-                    logger.info(f"Blending shape params with weight={conf:.3f}")
+                    logger.debug(f"Blending shape params with weight={conf:.3f}")
                     pred_params = (1.0 - conf) * pred_params + conf * target_params
         except Exception as e:
             logger.warning(f"Shape refit blend failed: {e}")

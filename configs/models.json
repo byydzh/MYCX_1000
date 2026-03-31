@@ -1,0 +1,9 @@
+{
+  "skeleton_kf": {
+    "name": "Skeleton + Kalman Filter",
+    "description": "基于历史骨架拟合 + 实时卡尔曼滤波修正",
+    "engine_class": "PredictionEngine",
+    "module": "prediction_engine",
+    "config_dir": "configs/models/skeleton_kf"
+  }
+}
