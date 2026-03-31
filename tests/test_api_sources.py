@@ -21,7 +21,8 @@ class TestApiSources(unittest.TestCase):
             self.assertIsInstance(ds, BandoriDataSource)
             self.assertEqual(ds.api_source, "hhwx")
             self.assertIn("type=event", ds.api_config["tracker_url"])
-            self.assertIn("hhwx.org/api/bestdori/eventtop/data", ds.api_config["top10_url"])
+            self.assertIn("hhwx.org/api/tracker/data", ds.api_config["top10_url"])
+            self.assertIn("tier=10", ds.api_config["top10_url"])
         finally:
             ds.close()
 
@@ -67,6 +68,31 @@ class TestApiSources(unittest.TestCase):
             self.assertIn("type=event", called_url)
             self.assertIn("tier=1000", called_url)
             self.assertListEqual(df["ep"].tolist(), [100, 120])
+        finally:
+            ds.close()
+
+    def test_fetch_top10_max_speed_supports_tracker_cutoffs_payload(self):
+        ds = create_data_source("hhwx")
+        try:
+            mock_response = MagicMock()
+            mock_response.raise_for_status.return_value = None
+            mock_response.json.return_value = {
+                "result": True,
+                "cutoffs": [
+                    {"time": 0, "ep": 0},
+                    {"time": 3600000, "ep": 6000},
+                    {"time": 7200000, "ep": 15000},
+                    {"time": 10800000, "ep": 21000},
+                ],
+            }
+            ds.session.get = MagicMock(return_value=mock_response)
+
+            scale = ds.fetch_top10_max_speed(304)
+
+            called_url = ds.session.get.call_args.args[0]
+            self.assertIn("https://hhwx.org/api/tracker/data", called_url)
+            self.assertIn("tier=10", called_url)
+            self.assertGreater(scale, 0)
         finally:
             ds.close()
 

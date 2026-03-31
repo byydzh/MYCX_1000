@@ -75,6 +75,8 @@ def calculate_derived_columns(event_data: EventData) -> EventData:
         df.loc[df['speed'] < 0, 'speed'] = 0.0
         
     if 'norm_speed' not in df.columns:
+        if event_data.scale is None or event_data.scale <= 0:
+            raise ValueError("无法获取有效的 T10 scale，请检查所选 API 数据源是否提供对应的 tier=10 / eventtop 数据。")
         df['norm_speed'] = df['speed'] / event_data.scale
         
     event_data.df = df

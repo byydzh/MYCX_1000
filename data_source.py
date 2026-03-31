@@ -186,16 +186,38 @@ class BandoriDataSource:
 
         return float(np.mean(valid.nlargest(3).values))
 
+    def _calculate_scale_from_cutoffs(self, cutoffs, debug_limit_ts=None):
+        if not cutoffs:
+            return None
+
+        df = pd.DataFrame(cutoffs)
+        if debug_limit_ts is not None:
+            df = df[df["time"] <= debug_limit_ts]
+        if df.empty or "ep" not in df.columns:
+            return None
+
+        df = df.sort_values("time").copy()
+        df["speed"] = df["ep"].diff() / (df["time"].diff() / 60000)
+        valid = df[(df["speed"] > 0) & (df["speed"] < 1000000)]["speed"]
+        if valid.empty:
+            return None
+
+        return float(np.mean(valid.nlargest(3).values))
+
     def fetch_top10_max_speed(self, event_id, debug_limit_ts=None):
         url = self.api_config['top10_url'].format(
             server=self.server_index,
             event_id=event_id,
         )
         data = self._get_json(url, timeout=10)
-        if not data or "points" not in data:
+        if not data:
             return None
 
-        return self._calculate_scale_from_points(data["points"], debug_limit_ts=debug_limit_ts)
+        if "points" in data:
+            return self._calculate_scale_from_points(data["points"], debug_limit_ts=debug_limit_ts)
+        if "cutoffs" in data:
+            return self._calculate_scale_from_cutoffs(data["cutoffs"], debug_limit_ts=debug_limit_ts)
+        return None
 
     def fetch_event_data_pack(self, event_id):
         """
