@@ -14,8 +14,7 @@ API_SOURCE_CONFIGS = {
         "event_index_url": "https://hhwx.org/api/bestdori/events",
         "event_meta_url": "https://hhwx.org/api/bestdori/event/{event_id}",
         "tracker_url": "https://hhwx.org/api/tracker/data?server={server}&event={event_id}&type=event&tier={tier}",
-        # HHWX 页面暂未暴露 eventtop 对应接口，这里保留 Bestdori 作为 scale 兜底
-        "top10_url": "https://bestdori.com/api/eventtop/data?server={server}&event={event_id}&mid=0&interval=3600000",
+        "top10_url": "https://hhwx.org/api/bestdori/eventtop/data?server={server}&event={event_id}&mid=0&interval=3600000",
     },
     "bestdori": {
         "label": "Bestdori Public API",

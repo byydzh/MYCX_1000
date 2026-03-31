@@ -21,7 +21,7 @@ class TestApiSources(unittest.TestCase):
             self.assertIsInstance(ds, BandoriDataSource)
             self.assertEqual(ds.api_source, "hhwx")
             self.assertIn("type=event", ds.api_config["tracker_url"])
-            self.assertIn("bestdori.com/api/eventtop/data", ds.api_config["top10_url"])
+            self.assertIn("hhwx.org/api/bestdori/eventtop/data", ds.api_config["top10_url"])
         finally:
             ds.close()
 
