@@ -5,12 +5,12 @@ import pandas as pd
 import numpy as np
 
 # 引入所有组件
-from data_source import BestdoriDataSource
+from data_source import create_data_source
 from domain_models import EventData, EventMeta
 from math_models import SeasonalityHandler, CosineModeler
 from prediction_engine import PredictionEngine
 from visualizer import Visualizer
-from config import DEFAULT_CONFIG
+from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG
 
 # 设置日志
 logging.basicConfig(
@@ -23,7 +23,7 @@ logger = logging.getLogger('pipeline')
 class PredictionPipeline:
     def __init__(self, config=None):
         self.config = config or DEFAULT_CONFIG
-        self.data_source = BestdoriDataSource()
+        self.data_source = create_data_source(self.config.get('api_source'))
         
         self.seasonality = SeasonalityHandler(
             weekend_multiplier=float(self.config.get('weekend_multiplier', 1.0)),
@@ -149,9 +149,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--event_id', '-e', type=int, help='Target Event ID')
     parser.add_argument('--debug_hours', '-d', type=float, help='Debug hours limit')
+    parser.add_argument(
+        '--api-source',
+        choices=sorted(API_SOURCE_CONFIGS.keys()),
+        help='API source profile'
+    )
     args = parser.parse_args()
 
-    pipeline = PredictionPipeline()
+    runtime_config = DEFAULT_CONFIG.copy()
+    if args.api_source:
+        runtime_config['api_source'] = args.api_source
+
+    pipeline = PredictionPipeline(config=runtime_config)
     
     if args.event_id:
         pipeline.run(target_event_id=args.event_id, debug_hours=args.debug_hours)

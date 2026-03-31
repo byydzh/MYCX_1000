@@ -26,6 +26,78 @@ class PredictionEngine:
         self.modeler = modeler
         self.config = config or DEFAULT_CONFIG
 
+    def _get_refit_frame(self, target: EventData) -> pd.DataFrame:
+        """为在线 refit 选择更稳健的观测窗口。"""
+        if 'skeleton_speed' not in target.df.columns:
+            return pd.DataFrame()
+
+        df = target.df.copy()
+        refit_start = float(self.config.get('refit_start_hours', self.config.get('t_start_cmp', 6.0)))
+        df = df[df['hours_elapsed'] >= refit_start]
+
+        recent_hours = self.config.get('refit_recent_hours')
+        if recent_hours is not None:
+            recent_hours = float(recent_hours)
+            if recent_hours > 0 and not df.empty:
+                max_h = float(df['hours_elapsed'].max())
+                df = df[df['hours_elapsed'] >= max(refit_start, max_h - recent_hours)]
+
+        valid_mask = (
+            np.isfinite(df['skeleton_speed']) &
+            np.isfinite(df['norm_speed']) &
+            np.isfinite(df['hours_elapsed'])
+        )
+        return df.loc[valid_mask].copy()
+
+    def _get_refit_confidence(self, target: EventData) -> float:
+        """基于有效 refit 窗口而不是总观测时长计算混合权重。"""
+        refit_df = self._get_refit_frame(target)
+        if refit_df.empty:
+            return 0.0
+
+        span_hours = float(refit_df['hours_elapsed'].max() - refit_df['hours_elapsed'].min())
+        norm_hours = float(self.config.get('refit_conf_norm_hours', 72.0))
+        conf_max = float(self.config.get('refit_conf_max', 0.35))
+        if norm_hours <= 0:
+            return 0.0
+
+        return float(np.clip(span_hours / norm_hours, 0.0, conf_max))
+
+    def _get_refit_bounds(self, prior: np.ndarray):
+        """围绕历史先验构造有符号的局部边界，避免参数被错误投影到 0。"""
+        base_min_ratio = float(self.config.get('refit_base_min_ratio', 0.6))
+        base_max_ratio = float(self.config.get('refit_base_max_ratio', 1.6))
+        linear_scale = float(self.config.get('refit_linear_bound_scale', 2.0))
+        linear_zero_ratio = float(self.config.get('refit_linear_zero_ratio', 0.25))
+        quad_min_ratio = float(self.config.get('refit_quad_min_ratio', 0.1))
+        quad_max_ratio = float(self.config.get('refit_quad_max_ratio', 2.0))
+
+        base_prior = float(prior[0])
+        base_lower = max(0.0, base_prior * base_min_ratio)
+        base_upper = max(base_lower + 1e-9, base_prior * base_max_ratio)
+
+        a_prior = float(prior[1])
+        if a_prior < 0:
+            a_lower = a_prior * linear_scale
+            a_upper = min(a_prior * linear_zero_ratio, -1e-9)
+        elif a_prior > 0:
+            a_lower = max(a_prior * linear_zero_ratio, 1e-9)
+            a_upper = a_prior * linear_scale
+        else:
+            a_lower, a_upper = -1e-4, 1e-4
+
+        b_prior = float(prior[2])
+        if b_prior < 0:
+            b_lower = b_prior * quad_max_ratio
+            b_upper = min(b_prior * linear_zero_ratio, -1e-9)
+        elif b_prior > 0:
+            b_lower = max(b_prior * quad_min_ratio, 1e-9)
+            b_upper = b_prior * quad_max_ratio
+        else:
+            b_lower, b_upper = 0.0, 1e-4
+
+        return [(base_lower, base_upper), (a_lower, a_upper), (b_lower, b_upper)]
+
     def _get_window_intensity(self, df: pd.DataFrame, t_start: float, t_end: float) -> Optional[float]:
         """计算指定时间窗口内的平均“骨架速度”(Skeleton Speed)。"""
         mask = (df['hours_elapsed'] >= t_start) & \
@@ -131,15 +203,12 @@ class PredictionEngine:
         如果观测点不足则返回 initial_params 不变。
         """
         try:
-            if 'skeleton_speed' not in target.df.columns:
+            refit_df = self._get_refit_frame(target)
+            if len(refit_df) < int(self.config.get('refit_min_points', 10)):
                 return initial_params
 
-            valid_mask = np.isfinite(target.df['skeleton_speed'])
-            if valid_mask.sum() < int(self.config.get('refit_min_points', 10)):
-                return initial_params
-
-            t_obs = target.df.loc[valid_mask, 'hours_elapsed'].values
-            v_obs = target.df.loc[valid_mask, 'skeleton_speed'].values
+            t_obs = refit_df['hours_elapsed'].values
+            v_obs = refit_df['skeleton_speed'].values
 
             # 权重计算 (Logarithmic Weighting)
             # 目的：降低夜间低数据量（低 norm_speed）对拟合的影响，防止噪声被放大
@@ -147,7 +216,7 @@ class PredictionEngine:
             # 1. 极低值 (0.05) -> 权重小
             # 2. 中高值 (0.5 - 1.0) -> 权重差异不大
             weight_scale = float(self.config.get('refit_weight_scale', 10.0))
-            raw_obs = target.df.loc[valid_mask, 'norm_speed'].values
+            raw_obs = refit_df['norm_speed'].values
             raw_obs = np.maximum(raw_obs, 0.0) # 保护非负
             
             weights = np.log1p(raw_obs * weight_scale)
@@ -162,7 +231,8 @@ class PredictionEngine:
             total_hours = target.meta.total_hours
 
             # 自适应正则强度，依据观测量级和观测能量
-            lambda_reg = float(self.config.get('refit_lambda', 0.3)) * (np.mean(v_obs ** 2) + 1e-6)
+            # 这里额外乘一个系数，让在线 refit 更偏向“局部微调”而不是推翻历史先验。
+            lambda_reg = 2.0 * float(self.config.get('refit_lambda', 0.3)) * (np.mean(v_obs ** 2) + 1e-6)
 
             def loss(x):
                 # x[0] -> Base, x[1] -> A, x[2] -> B
@@ -182,8 +252,7 @@ class PredictionEngine:
                 reg_B = ((x[2] - prior[2]) ** 2) / (prior[2] ** 2 + 1e-9)
                 return mse + lambda_reg * (reg_Base + reg_A + reg_B)
 
-            # Base, A, B 均需非负
-            bounds = [(0.0, None), (0.0, None), (0.0, None)]
+            bounds = self._get_refit_bounds(prior)
             x0 = [prior[0], prior[1], prior[2]]
             res = minimize(loss, x0=x0, bounds=bounds, method='L-BFGS-B')
 
@@ -192,7 +261,10 @@ class PredictionEngine:
                 new_params[0] = float(res.x[0])
                 new_params[1] = float(res.x[1])
                 new_params[2] = float(res.x[2])
-                logger.info(f"Refit params: Base {prior[0]:.4f}->{new_params[0]:.4f}, A {prior[1]:.5f}->{new_params[1]:.5f}, B {prior[2]:.6f}->{new_params[2]:.6f}")
+                logger.info(
+                    "Refit params: Base %.4f->%.4f, A %.5f->%.5f, B %.6f->%.6f | window=%d pts",
+                    prior[0], new_params[0], prior[1], new_params[1], prior[2], new_params[2], len(refit_df)
+                )
                 return new_params
             else:
                 return initial_params
@@ -583,7 +655,7 @@ class PredictionEngine:
         try:
             target_params = self._refit_shape_params(target, pred_params)
             if target_params is not None:
-                conf = float(np.clip(observed_hours / float(self.config.get('refit_conf_norm_hours', 24.0)), 0.0, 0.9))
+                conf = self._get_refit_confidence(target)
                 # 当观测足够多时，优先使用观测拟合的参数
                 if conf > 0.0:
                     logger.info(f"Blending shape params with weight={conf:.3f}")

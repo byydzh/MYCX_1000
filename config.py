@@ -1,9 +1,36 @@
 # config.py
 
 # ==========================================
+# API 数据源配置
+# ==========================================
+DEFAULT_SERVER = 3  # 国服
+DEFAULT_API_SOURCE = "hhwx"
+
+API_SOURCE_CONFIGS = {
+    "hhwx": {
+        "label": "HHWX Tracker Proxy",
+        "event_index_url": "https://hhwx.org/api/bestdori/events",
+        "event_meta_url": "https://hhwx.org/api/bestdori/event/{event_id}",
+        "tracker_url": "https://hhwx.org/api/tracker/data?server={server}&event={event_id}&type=event&tier={tier}",
+        # HHWX 页面暂未暴露 eventtop 对应接口，这里保留 Bestdori 作为 scale 兜底
+        "top10_url": "https://bestdori.com/api/eventtop/data?server={server}&event={event_id}&mid=0&interval=3600000",
+    },
+    "bestdori": {
+        "label": "Bestdori Public API",
+        "event_index_url": "https://bestdori.com/api/events/all.3.json",
+        "event_meta_url": "https://bestdori.com/api/events/{event_id}.json",
+        "tracker_url": "https://bestdori.com/api/tracker/data?server={server}&event={event_id}&tier={tier}",
+        "top10_url": "https://bestdori.com/api/eventtop/data?server={server}&event={event_id}&mid=0&interval=3600000",
+    },
+}
+
+# ==========================================
 # 预测器默认配置字典 (Default Configuration)
 # ==========================================
 DEFAULT_CONFIG = {
+    # --- 数据源 ---
+    'api_source': DEFAULT_API_SOURCE, # 默认使用的 API profile
+
     # --- 节律与模型参数 ---
     'weekend_multiplier': 1.1,      # 周末增强系数 (1.0 = 无增强, >1.0 = 周末加速)
     'panic_ease_power': 1.0,        # 恐慌期缓动指数 (控制最后时刻加速曲线的弯曲程度)
@@ -33,4 +60,14 @@ DEFAULT_CONFIG = {
 
     # --- 拟合权重参数 ---
     'refit_weight_scale': 10.0,     # 对数加权系数 (log1p(x * scale))，越大则低值区权重越低
+    'refit_start_hours': 6.0,       # Refit 起始时间，避免首日冷启动直接拉歪形状
+    'refit_recent_hours': 48.0,     # Refit 仅关注最近一段观测窗口，避免过早历史过度主导
+    'refit_conf_norm_hours': 72.0,  # Refit 置信度归一化时长
+    'refit_conf_max': 0.35,         # Refit 最大混合权重，避免在线重拟合直接接管骨架
+    'refit_base_min_ratio': 0.6,    # Base 对先验的下界比例
+    'refit_base_max_ratio': 1.6,    # Base 对先验的上界比例
+    'refit_linear_bound_scale': 2.0,# A 对先验的可扩张倍数（保留符号）
+    'refit_linear_zero_ratio': 0.25,# A 向 0 收缩的最近边界比例（保留符号）
+    'refit_quad_min_ratio': 0.1,    # B 对先验的下界比例，防止被直接压成 0
+    'refit_quad_max_ratio': 2.0,    # B 对先验的上界比例
 }

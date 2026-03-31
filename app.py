@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # 引入新架构的组件
-from config import DEFAULT_CONFIG
-from data_source import BestdoriDataSource
+from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG
+from data_source import create_data_source
 from domain_models import EventData, EventMeta
 from math_models import SeasonalityHandler, CosineModeler
 from prediction_engine import PredictionEngine
@@ -98,6 +98,17 @@ manual_btn = st.sidebar.button("⚡ 立即运行预测", type="primary")
 st.sidebar.markdown("---")
 with st.sidebar.expander("参数设置", expanded=False):
     st.caption("调整下列参数将覆盖 config.py 的默认值")
+
+    api_source_keys = list(API_SOURCE_CONFIGS.keys())
+    default_api_source = DEFAULT_CONFIG.get('api_source', api_source_keys[0])
+    default_api_index = api_source_keys.index(default_api_source) if default_api_source in api_source_keys else 0
+    selected_api_source = st.selectbox(
+        "API 数据源",
+        options=api_source_keys,
+        index=default_api_index,
+        format_func=lambda key: API_SOURCE_CONFIGS[key].get('label', key),
+        help="切换活动元数据与榜线数据接口；HHWX 配置默认启用，T10 scale 仍会保留 Bestdori 兜底。"
+    )
     
     # 模型参数
     st.markdown("**模型参数**")
@@ -209,6 +220,7 @@ if should_run:
     # 构造本次运行的配置字典
     current_config = DEFAULT_CONFIG.copy()
     current_config.update({
+        'api_source': selected_api_source,
         'weekend_multiplier': weekend_mult,
         'panic_scaler': panic_scaler,
         'panic_ease_power': panic_ease_power,
@@ -223,7 +235,7 @@ if should_run:
     })
 
     with st.spinner(f"🐱 ({trigger_reason}) 正在计算中..."):
-        ds = BestdoriDataSource()
+        ds = create_data_source(current_config.get('api_source'))
         try:
             # 1. 获取目标 ID
             if enable_debug and debug_event_id:
