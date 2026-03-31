@@ -204,8 +204,8 @@ class BandoriDataSource:
 
         return float(np.mean(valid.nlargest(3).values))
 
-    def fetch_top10_max_speed(self, event_id, debug_limit_ts=None):
-        url = self.api_config['top10_url'].format(
+    def _fetch_top10_max_speed_from_config(self, api_config, event_id, debug_limit_ts=None):
+        url = api_config['top10_url'].format(
             server=self.server_index,
             event_id=event_id,
         )
@@ -217,6 +217,29 @@ class BandoriDataSource:
             return self._calculate_scale_from_points(data["points"], debug_limit_ts=debug_limit_ts)
         if "cutoffs" in data:
             return self._calculate_scale_from_cutoffs(data["cutoffs"], debug_limit_ts=debug_limit_ts)
+        return None
+
+    def fetch_top10_max_speed(self, event_id, debug_limit_ts=None):
+        scale = self._fetch_top10_max_speed_from_config(
+            self.api_config,
+            event_id,
+            debug_limit_ts=debug_limit_ts,
+        )
+        if scale is not None:
+            return scale
+
+        if self.api_source != 'bestdori':
+            fallback_config = API_SOURCE_CONFIGS.get('bestdori')
+            if fallback_config:
+                logger.info(
+                    f"[{self.api_source}] Scale missing for event {event_id}, fallback to bestdori eventtop"
+                )
+                return self._fetch_top10_max_speed_from_config(
+                    fallback_config,
+                    event_id,
+                    debug_limit_ts=debug_limit_ts,
+                )
+
         return None
 
     def fetch_event_data_pack(self, event_id):

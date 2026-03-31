@@ -252,7 +252,7 @@ with st.sidebar.expander("参数设置", expanded=False):
         options=api_source_keys,
         index=api_source_keys.index(selected_api_source_key),
         format_func=lambda key: API_SOURCE_CONFIGS[key].get('label', key),
-        help="切换整套活动元数据、榜线数据和 T10 scale 数据接口。",
+        help="切换活动元数据与榜线数据接口；T10 scale 会优先使用所选数据源，若历史 tier=10 缺失则自动回退 Bestdori eventtop。",
         key=_config_state_key('api_source'),
     )
     

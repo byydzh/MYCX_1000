@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -93,6 +94,32 @@ class TestApiSources(unittest.TestCase):
             self.assertIn("https://hhwx.org/api/tracker/data", called_url)
             self.assertIn("tier=10", called_url)
             self.assertGreater(scale, 0)
+        finally:
+            ds.close()
+
+    def test_fetch_top10_max_speed_falls_back_to_bestdori_when_hhwx_is_empty(self):
+        ds = create_data_source("hhwx")
+        try:
+            responses = [
+                {"result": True, "cutoffs": []},
+                {
+                    "points": [
+                        {"time": 0, "uid": 1, "value": 0},
+                        {"time": 3600000, "uid": 1, "value": 6000},
+                        {"time": 0, "uid": 2, "value": 0},
+                        {"time": 3600000, "uid": 2, "value": 6200},
+                        {"time": 0, "uid": 3, "value": 0},
+                        {"time": 3600000, "uid": 3, "value": 6100},
+                    ],
+                    "users": [],
+                },
+            ]
+
+            with patch.object(ds, "_get_json", side_effect=responses) as mock_get_json:
+                scale = ds.fetch_top10_max_speed(301)
+
+            self.assertAlmostEqual(scale, ((6000 + 6200 + 6100) / 3) / 60.0)
+            self.assertEqual(mock_get_json.call_count, 2)
         finally:
             ds.close()
 
