@@ -193,7 +193,6 @@ if st.session_state.get(MODEL_STATE_KEY) not in model_options:
 selected_model = st.sidebar.selectbox(
     "预测模型",
     options=model_options,
-    index=model_options.index(st.session_state[MODEL_STATE_KEY]),
     format_func=lambda model_id: model_lookup[model_id].get("name", model_id),
     key=MODEL_STATE_KEY,
     disabled=len(model_options) <= 1,
@@ -221,7 +220,6 @@ if st.session_state.get(PRESET_STATE_KEY) not in preset_options:
 selected_preset = st.sidebar.selectbox(
     "配置预设",
     options=preset_options,
-    index=preset_options.index(st.session_state[PRESET_STATE_KEY]),
     format_func=lambda preset_id: preset_lookup[preset_id].get("name", preset_id),
     key=PRESET_STATE_KEY,
 )

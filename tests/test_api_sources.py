@@ -22,21 +22,30 @@ class TestApiSources(unittest.TestCase):
             self.assertIsInstance(ds, BandoriDataSource)
             self.assertEqual(ds.api_source, "hhwx")
             self.assertIn("type=event", ds.api_config["tracker_url"])
-            self.assertIn("hhwx.org/api/tracker/data", ds.api_config["top10_url"])
+            self.assertIn("hhwx.org/api/bandori/tracker/data", ds.api_config["top10_url"])
             self.assertIn("tier=10", ds.api_config["top10_url"])
         finally:
             ds.close()
 
-    def test_fetch_event_meta_normalizes_hhwx_proxy_payload(self):
+    def test_fetch_event_meta_extracts_from_hhwx_events_index(self):
         ds = create_data_source("hhwx")
         try:
             mock_response = MagicMock()
             mock_response.raise_for_status.return_value = None
             mock_response.json.return_value = {
-                "eventType": "mission_live",
-                "startAt": ["1000", None, None, "2000", None],
-                "endAt": ["3000", None, None, "4000", None],
-                "aggregateEndAt": ["5000", None, None, "6000", None],
+                "success": True,
+                "data": {
+                    "events": [
+                        {
+                            "eventId": 312,
+                            "eventType": "mission_live",
+                            "timeline": {
+                                "jp": {"startAt": 1000, "endAt": 3000},
+                                "cn": {"startAt": 2000, "endAt": 4000},
+                            },
+                        }
+                    ]
+                },
             }
             ds.session.get = MagicMock(return_value=mock_response)
 
@@ -46,7 +55,7 @@ class TestApiSources(unittest.TestCase):
             self.assertEqual(meta["event_type"], "mission_live")
             self.assertEqual(meta["start_at"], 2000)
             self.assertEqual(meta["end_at"], 4000)
-            self.assertEqual(meta["aggregate_at"], 6000)
+            self.assertEqual(meta["aggregate_at"], 4000)
         finally:
             ds.close()
 
@@ -64,7 +73,7 @@ class TestApiSources(unittest.TestCase):
             df = ds.fetch_tier_1000_data(312)
 
             called_url = ds.session.get.call_args.args[0]
-            self.assertIn("https://hhwx.org/api/tracker/data", called_url)
+            self.assertIn("https://hhwx.org/api/bandori/tracker/data", called_url)
             self.assertIn("event=312", called_url)
             self.assertIn("type=event", called_url)
             self.assertIn("tier=1000", called_url)
@@ -91,7 +100,7 @@ class TestApiSources(unittest.TestCase):
             scale = ds.fetch_top10_max_speed(304)
 
             called_url = ds.session.get.call_args.args[0]
-            self.assertIn("https://hhwx.org/api/tracker/data", called_url)
+            self.assertIn("https://hhwx.org/api/bandori/tracker/data", called_url)
             self.assertIn("tier=10", called_url)
             self.assertGreater(scale, 0)
         finally:

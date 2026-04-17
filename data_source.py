@@ -11,6 +11,37 @@ from config import API_SOURCE_CONFIGS, DEFAULT_API_SOURCE, DEFAULT_SERVER
 
 logger = logging.getLogger('predictor.datasource')
 
+SERVER_KEYS_BY_INDEX = ['jp', 'tw', 'en', 'cn', 'kr']
+
+
+def _normalize_hhwx_events_payload(payload):
+    """把 /api/bandori/events 的新结构摊平成旧 bestdori 代理风格的字典。"""
+    events = payload.get('data', {}).get('events') if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        return None
+
+    normalized = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        eid = ev.get('eventId')
+        if eid is None:
+            continue
+        timeline = ev.get('timeline') or {}
+        starts = [None] * len(SERVER_KEYS_BY_INDEX)
+        ends = [None] * len(SERVER_KEYS_BY_INDEX)
+        for idx, key in enumerate(SERVER_KEYS_BY_INDEX):
+            slot = timeline.get(key)
+            if isinstance(slot, dict):
+                starts[idx] = slot.get('startAt')
+                ends[idx] = slot.get('endAt')
+        normalized[str(eid)] = {
+            'startAt': starts,
+            'endAt': ends,
+            'eventType': ev.get('eventType'),
+        }
+    return normalized
+
 
 def resolve_api_source_config(api_source):
     source_key = (api_source or DEFAULT_API_SOURCE).lower()
@@ -40,13 +71,14 @@ class BandoriDataSource:
         if self.session:
             self.session.close()
 
-    def _get_json(self, url, timeout=10):
+    def _get_json(self, url, timeout=10, suppress_log=False):
         try:
             response = self.session.get(url, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning(f"[{self.api_source}] Request failed: {url} | {e}")
+            log = logger.debug if suppress_log else logger.warning
+            log(f"[{self.api_source}] Request failed: {url} | {e}")
             return None
 
     def _extract_server_timestamp(self, meta, *field_names):
@@ -72,7 +104,11 @@ class BandoriDataSource:
 
     def fetch_events_index(self, timeout=8):
         url = self.api_config['event_index_url']
-        return self._get_json(url, timeout=timeout)
+        payload = self._get_json(url, timeout=timeout)
+        if isinstance(payload, dict) and isinstance(payload.get('data'), dict) \
+                and 'events' in payload['data']:
+            return _normalize_hhwx_events_payload(payload)
+        return payload
 
     def get_current_event_id(self, server_index=None):
         """
@@ -126,8 +162,15 @@ class BandoriDataSource:
         return nearest_candidate
 
     def fetch_event_meta(self, event_id):
-        url = self.api_config['event_meta_url'].format(event_id=event_id)
-        metadata = self._get_json(url, timeout=5)
+        url_template = self.api_config.get('event_meta_url')
+        metadata = None
+        if url_template:
+            url = url_template.format(event_id=event_id)
+            metadata = self._get_json(url, timeout=5)
+        if not metadata:
+            all_events = self.fetch_events_index()
+            if isinstance(all_events, dict):
+                metadata = all_events.get(str(int(event_id)))
         if not metadata:
             return None
 
@@ -204,12 +247,12 @@ class BandoriDataSource:
 
         return float(np.mean(valid.nlargest(3).values))
 
-    def _fetch_top10_max_speed_from_config(self, api_config, event_id, debug_limit_ts=None):
+    def _fetch_top10_max_speed_from_config(self, api_config, event_id, debug_limit_ts=None, suppress_log=False):
         url = api_config['top10_url'].format(
             server=self.server_index,
             event_id=event_id,
         )
-        data = self._get_json(url, timeout=10)
+        data = self._get_json(url, timeout=10, suppress_log=suppress_log)
         if not data:
             return None
 
@@ -220,25 +263,26 @@ class BandoriDataSource:
         return None
 
     def fetch_top10_max_speed(self, event_id, debug_limit_ts=None):
+        has_bestdori_fallback = self.api_source != 'bestdori' and 'bestdori' in API_SOURCE_CONFIGS
         scale = self._fetch_top10_max_speed_from_config(
             self.api_config,
             event_id,
             debug_limit_ts=debug_limit_ts,
+            suppress_log=has_bestdori_fallback,
         )
         if scale is not None:
             return scale
 
-        if self.api_source != 'bestdori':
-            fallback_config = API_SOURCE_CONFIGS.get('bestdori')
-            if fallback_config:
-                logger.info(
-                    f"[{self.api_source}] Scale missing for event {event_id}, fallback to bestdori eventtop"
-                )
-                return self._fetch_top10_max_speed_from_config(
-                    fallback_config,
-                    event_id,
-                    debug_limit_ts=debug_limit_ts,
-                )
+        if has_bestdori_fallback:
+            fallback_config = API_SOURCE_CONFIGS['bestdori']
+            logger.info(
+                f"[{self.api_source}] Scale missing for event {event_id}, fallback to bestdori eventtop"
+            )
+            return self._fetch_top10_max_speed_from_config(
+                fallback_config,
+                event_id,
+                debug_limit_ts=debug_limit_ts,
+            )
 
         return None
 

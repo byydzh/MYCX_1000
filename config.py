@@ -11,10 +11,10 @@ DEFAULT_API_SOURCE = "hhwx"
 API_SOURCE_CONFIGS = {
     "hhwx": {
         "label": "HHWX Tracker Proxy",
-        "event_index_url": "https://hhwx.org/api/bestdori/events",
-        "event_meta_url": "https://hhwx.org/api/bestdori/event/{event_id}",
-        "tracker_url": "https://hhwx.org/api/tracker/data?server={server}&event={event_id}&type=event&tier={tier}",
-        "top10_url": "https://hhwx.org/api/tracker/data?server={server}&event={event_id}&type=event&tier=10",
+        "event_index_url": "https://hhwx.org/api/bandori/events",
+        "event_meta_url": None,
+        "tracker_url": "https://hhwx.org/api/bandori/tracker/data?server={server}&event={event_id}&type=event&tier={tier}",
+        "top10_url": "https://hhwx.org/api/bandori/tracker/data?server={server}&event={event_id}&type=event&tier=10",
     },
     "bestdori": {
         "label": "Bestdori Public API",
