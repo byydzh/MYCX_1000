@@ -23,6 +23,7 @@
 !prediction_engine.py
 !math_models.py
 !visualizer.py
+!plotly_viz.py
 !main_pipeline.py
 !tuner
 !tuner/*.py

@@ -9,6 +9,9 @@ scipy==1.16.3
 streamlit==1.51.0
 streamlit-autorefresh==1.0.1
 
+# Interactive charts
+plotly==6.7.0
+
 # Optional / locale helpers
 chinesecalendar==1.11.0
 

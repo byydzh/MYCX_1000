@@ -11,17 +11,14 @@ import time
 import traceback
 import numpy as np
 import pandas as pd
-from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-# 引入新架构的组件
 from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG, list_models, list_presets, load_preset
 from data_source import create_data_source
 from domain_models import EventData, EventMeta
 from math_models import SeasonalityHandler, CosineModeler
 from prediction_engine import PredictionEngine
-from visualizer import Visualizer
+from plotly_viz import plot_prediction_plotly
 
 # ==========================================
 # 0. 辅助函数 (从 main_pipeline 复用逻辑)
@@ -171,6 +168,16 @@ if 'has_initialized' not in st.session_state:
     st.session_state['has_initialized'] = False
 if PRESET_SIGNATURE_KEY not in st.session_state:
     st.session_state[PRESET_SIGNATURE_KEY] = None
+if 'current_score' not in st.session_state:
+    st.session_state['current_score'] = None
+if 'predicted_score' not in st.session_state:
+    st.session_state['predicted_score'] = None
+if 'actual_score' not in st.session_state:
+    st.session_state['actual_score'] = None
+if 'current_event_id' not in st.session_state:
+    st.session_state['current_event_id'] = None
+if 'is_debug_mode' not in st.session_state:
+    st.session_state['is_debug_mode'] = False
 
 # ==========================================
 # 3. 侧边栏控制
@@ -701,7 +708,6 @@ if should_run:
                     )
                     modeler = CosineModeler()
                     engine = PredictionEngine(seasonality, modeler, config=current_config)
-                    visualizer = Visualizer()
 
                     # 5. 执行预测
                     result = engine.predict(
@@ -711,20 +717,23 @@ if should_run:
                         manual_points=manual_points
                     )
 
-                    # 6. 绘图 (内存操作)
-                    fig = visualizer.plot_prediction(
+                    # 6. 绘图 (Plotly 交互式)
+                    fig = plot_prediction_plotly(
                         target_data,
                         result,
                         debug_hours=target_debug_h,
                         manual_points=manual_points,
-                        save=False
                     )
-                    
-                    # 转 BytesIO
-                    buf = BytesIO()
-                    FigureCanvasAgg(fig).print_png(buf)
-                    buf.seek(0)
-                    st.session_state['img_bytes'] = buf
+                    st.session_state['img_bytes'] = fig
+                    st.session_state['current_score'] = int(result.future_score[0]) if len(result.future_score) > 0 else 0
+                    st.session_state['predicted_score'] = int(result.final_score)
+                    st.session_state['current_event_id'] = target_eid
+                    st.session_state['is_debug_mode'] = enable_debug
+                    st.session_state['actual_score'] = (
+                        int(target_data.full_df.iloc[-1]['value'])
+                        if enable_debug and target_data.full_df is not None and not target_data.full_df.empty
+                        else None
+                    )
                     
                     # 更新时间
                     beijing_tz = timezone(timedelta(hours=8))
@@ -746,17 +755,45 @@ col_img, col_info = st.columns([3, 1])
 
 with col_img:
     if st.session_state['img_bytes']:
-        st.image(
+        cur = st.session_state.get('current_score')
+        pred = st.session_state.get('predicted_score')
+        actual = st.session_state.get('actual_score')
+
+        if cur is not None and pred is not None:
+            score_text = f"当前: **{cur:,}**  |  预测最终: **{pred:,}**"
+            if actual is not None:
+                err = pred - actual
+                err_pct = err / actual * 100
+                score_text += f"  |  实际: **{actual:,}**  |  误差: **{err:+,} ({err_pct:+.1f}%)**"
+            st.markdown(score_text)
+
+        st.plotly_chart(
             st.session_state['img_bytes'],
-            caption=f"预测趋势图 (更新于: {st.session_state['last_update_str']})",
-            width="content"
+            use_container_width=True,
+            config={
+                'displaylogo': False,
+                'modeBarButtonsToRemove': [
+                    'select2d',
+                    'lasso2d',
+                    'autoScale2d',
+                    'toggleSpikelines',
+                ],
+                'toImageButtonOptions': {
+                    'format': 'png',
+                    'filename': 'event_prediction',
+                    'height': 900,
+                    'width': 1200,
+                    'scale': 2,
+                },
+            },
         )
+        st.caption(f"更新于: {st.session_state['last_update_str']}")
     else:
         st.info("🐱 暂无数据，正在等待初始化或手动触发...")
 
 with col_info:
     st.markdown("### 状态面板")
     st.write(f"最后更新: **{st.session_state['last_update_str']}**")
-    
+
     if st.session_state.get('img_bytes'):
-         st.success("系统运行正常 喵！")
+        st.success("系统运行正常 喵！")
