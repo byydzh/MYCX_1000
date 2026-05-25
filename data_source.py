@@ -60,11 +60,14 @@ class BandoriDataSource:
         self.server_index = server_index
         self.session = requests.Session()
         try:
-            adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=3)
+            adapter = HTTPAdapter(pool_connections=10, pool_maxsize=30, max_retries=3)
             self.session.mount('http://', adapter)
             self.session.mount('https://', adapter)
         except Exception as e:
             logger.warning(f"Failed to mount adapter: {e}")
+        self._events_index_cache = None
+        self._meta_cache: dict = {}
+        self._scale_cache: dict = {}
 
     def close(self):
         """关闭 Session 资源"""
@@ -103,12 +106,17 @@ class BandoriDataSource:
         return None
 
     def fetch_events_index(self, timeout=8):
+        if self._events_index_cache is not None:
+            return self._events_index_cache
         url = self.api_config['event_index_url']
         payload = self._get_json(url, timeout=timeout)
         if isinstance(payload, dict) and isinstance(payload.get('data'), dict) \
                 and 'events' in payload['data']:
-            return _normalize_hhwx_events_payload(payload)
-        return payload
+            result = _normalize_hhwx_events_payload(payload)
+        else:
+            result = payload
+        self._events_index_cache = result
+        return result
 
     def get_current_event_id(self, server_index=None):
         """
@@ -162,6 +170,9 @@ class BandoriDataSource:
         return nearest_candidate
 
     def fetch_event_meta(self, event_id):
+        if event_id in self._meta_cache:
+            return self._meta_cache[event_id]
+
         url_template = self.api_config.get('event_meta_url')
         metadata = None
         if url_template:
@@ -187,15 +198,17 @@ class BandoriDataSource:
         if start_at is None or end_at is None:
             return None
 
-        return {
+        result = {
             'event_id': int(event_id),
             'start_at': start_at,
             'end_at': end_at,
             'aggregate_at': aggregate_at or end_at,
             'event_type': metadata.get('eventType') or metadata.get('event_type') or 'unknown',
         }
+        self._meta_cache[event_id] = result
+        return result
 
-    def fetch_tier_1000_data(self, event_id, tier=1000):
+    def fetch_tier_data(self, event_id, tier=1000):
         url = self.api_config['tracker_url'].format(
             server=self.server_index,
             event_id=event_id,
@@ -210,6 +223,9 @@ class BandoriDataSource:
             return None
 
         return pd.DataFrame(cutoffs)
+
+    def fetch_tier_1000_data(self, event_id, tier=1000):
+        return self.fetch_tier_data(event_id, tier=tier)
 
     def _calculate_scale_from_points(self, points, debug_limit_ts=None):
         if not points:
@@ -263,6 +279,9 @@ class BandoriDataSource:
         return None
 
     def fetch_top10_max_speed(self, event_id, debug_limit_ts=None):
+        if event_id in self._scale_cache:
+            return self._scale_cache[event_id]
+
         has_bestdori_fallback = self.api_source != 'bestdori' and 'bestdori' in API_SOURCE_CONFIGS
         scale = self._fetch_top10_max_speed_from_config(
             self.api_config,
@@ -271,6 +290,7 @@ class BandoriDataSource:
             suppress_log=has_bestdori_fallback,
         )
         if scale is not None:
+            self._scale_cache[event_id] = scale
             return scale
 
         if has_bestdori_fallback:
@@ -278,27 +298,36 @@ class BandoriDataSource:
             logger.info(
                 f"[{self.api_source}] Scale missing for event {event_id}, fallback to bestdori eventtop"
             )
-            return self._fetch_top10_max_speed_from_config(
+            scale = self._fetch_top10_max_speed_from_config(
                 fallback_config,
                 event_id,
                 debug_limit_ts=debug_limit_ts,
             )
+            if scale is not None:
+                self._scale_cache[event_id] = scale
+            return scale
 
         return None
 
-    def fetch_event_data_pack(self, event_id):
+    def fetch_event_data_pack(self, event_id, tier=1000, meta=None, scale=None):
         """
-        获取单个活动的完整数据包（Meta, T1000, Scale）。
+        获取单个活动的完整数据包。
+        meta/scale 为 None 时会自动请求并缓存；可传入预取值跳过重复请求。
         """
-        meta = self.fetch_event_meta(event_id)
+        if meta is None:
+            meta = self.fetch_event_meta(event_id)
         if not meta:
             return None
 
-        df = self.fetch_tier_1000_data(event_id)
-        if df is None or df.empty:
-            return None
+        df = None
+        if tier is not None:
+            df = self.fetch_tier_data(event_id, tier=tier)
+            if df is None or df.empty:
+                logger.info(f"[{self.api_source}] Event {event_id} tier={tier}: 无可用数据")
+                return None
 
-        scale = self.fetch_top10_max_speed(event_id)
+        if scale is None:
+            scale = self.fetch_top10_max_speed(event_id)
         if scale is None:
             logger.warning(f"[{self.api_source}] Failed to fetch scale for event {event_id}")
 
@@ -306,7 +335,8 @@ class BandoriDataSource:
             'event_id': event_id,
             'meta': meta,
             'dataframe': df,
-            'scale': scale
+            'scale': scale,
+            'tier': tier,
         }
 
     def fetch_current_scale(self, event_id, debug_limit_ts=None):
@@ -319,9 +349,9 @@ class BandoriDataSource:
             logger.warning(f"Error fetching current scale: {e}")
             return None
 
-    def find_similar_events(self, target_event_id, event_type, count=5, ignore_ids=None):
+    def find_similar_events(self, target_event_id, event_type, count=5, ignore_ids=None, tier=1000):
         """
-        并发扫描同类活动。
+        并发扫描同类活动。按 tier 获取对应榜线数据。
         """
         if ignore_ids is None:
             ignore_ids = []
@@ -353,7 +383,7 @@ class BandoriDataSource:
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_eid = {
-                executor.submit(self.fetch_event_data_pack, eid): eid
+                executor.submit(self.fetch_event_data_pack, eid, tier): eid
                 for eid in candidates[:scan_limit]
             }
 

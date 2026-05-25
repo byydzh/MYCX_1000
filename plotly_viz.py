@@ -2,12 +2,26 @@
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from typing import Dict
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from math_models import CosineModeler
 from domain_models import EventData, PredictionResult
+
+TIER_COLORS: Dict[int, str] = {
+    500: '#1f77b4',
+    1000: '#2ca02c',
+    1500: '#ff7f0e',
+    2000: '#d62728',
+}
+
+TIER_DASH_STYLES: Dict[int, str] = {
+    500: 'solid',
+    1000: 'dash',
+    1500: 'dot',
+    2000: 'dashdot',
+}
 
 
 def _to_real_time(hours_array, start_ts, tz_offset=8):
@@ -44,71 +58,37 @@ def _last(arr):
 
 
 def plot_prediction_plotly(
-    target: EventData,
-    result: PredictionResult,
+    tier_data: Dict[int, EventData],
+    tier_results: Dict[int, PredictionResult],
     debug_hours: float = None,
     manual_points: list = None,
     tz_offset: int = 8,
 ) -> go.Figure:
-    """使用 Plotly 绘制交互式预测图，复刻原 matplotlib 双面板视觉风格"""
+    """使用 Plotly 绘制多线交互式预测图（速度 + 分数双面板）"""
 
-    modeler = CosineModeler()
-    start_ts = target.meta.start_at
+    tiers = sorted(t for t in tier_data if t in tier_results)
+    if not tiers:
+        return go.Figure()
 
-    has_manual = 'is_manual' in target.df.columns
-    if has_manual:
-        mask_real = ~target.df['is_manual']
-        mask_manual = target.df['is_manual']
-        obs_hours = target.df.loc[mask_real, 'hours_elapsed'].values
-        obs_score = target.df.loc[mask_real, 'value'].values
-        obs_speed = target.df.loc[mask_real, 'norm_speed'].values
-        manual_hours = target.df.loc[mask_manual, 'hours_elapsed'].values
-        manual_score = target.df.loc[mask_manual, 'value'].values
-        manual_speed = target.df.loc[mask_manual, 'norm_speed'].values
-    else:
-        obs_hours = target.df['hours_elapsed'].values
-        obs_score = target.df['value'].values
-        obs_speed = target.df['norm_speed'].values
-        manual_hours = np.array([])
-        manual_score = np.array([])
-        manual_speed = np.array([])
+    primary = tier_data[tiers[0]]
+    start_ts = primary.meta.start_at
+    event_id = primary.meta.event_id
 
-    obs_time = _to_real_time(obs_hours, start_ts, tz_offset)
-    pred_time = _to_real_time(result.future_t, start_ts, tz_offset)
-    full_time = _to_real_time(result.full_t_score, start_ts, tz_offset)
-    manual_time_dt = _to_real_time(manual_hours, start_ts, tz_offset) if len(manual_hours) > 0 else []
-
-    skeleton_y = modeler.shape_function(
-        result.future_t,
-        *result.used_params,
-        target.meta.total_hours,
-    )
+    has_manual = 'is_manual' in primary.df.columns
 
     if debug_hours is not None:
         now_hours = debug_hours
     else:
         if has_manual:
-            real_df = target.df[~target.df['is_manual']]
+            real_df = primary.df[~primary.df['is_manual']] if has_manual else primary.df
             now_hours = real_df['hours_elapsed'].max() if not real_df.empty else 0
         else:
-            now_hours = target.df['hours_elapsed'].max()
+            now_hours = primary.df['hours_elapsed'].max()
     now_dt = _first(_to_real_time(np.array([now_hours]), start_ts, tz_offset))
 
-    # ===== 提取真实最终分 =====
-    real_final_score = 0
-    real_final_time = None
-    if debug_hours is not None and target.full_df is not None and not target.full_df.empty:
-        full_df = target.full_df
-        real_final_score = full_df.iloc[-1]['value']
-        real_final_time = _to_real_time(
-            np.array([target.meta.total_hours]), start_ts, tz_offset
-        )
-        real_final_time = _first(real_final_time)
-
-    pred_final_score = result.final_score
-    pred_final_time = _last(full_time)
-    error_val = pred_final_score - real_final_score if real_final_score > 0 else None
-    error_pct = (error_val / real_final_score * 100) if error_val is not None else None
+    # ===== 构建标题 =====
+    pred_scores = [f"T{t}: {int(tier_results[t].final_score):,}" for t in tiers]
+    title_str = f"Event {event_id} Prediction  |  {'  |  '.join(pred_scores)}"
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -116,130 +96,149 @@ def plot_prediction_plotly(
         vertical_spacing=0.08,
         row_heights=[0.45, 0.55],
         subplot_titles=(
-            f"Event {target.meta.event_id} Speed Prediction",
-            f"Score Prediction: {int(pred_final_score):,} PT",
+            f"Event {event_id} Speed Prediction",
+            "Score Prediction",
         ),
     )
 
-    # ========================================
-    # 面板 1: Speed
-    # ========================================
-    if 'skeleton_speed' in target.df.columns:
+    # ========== 面板 1: Speed（各线叠加）==========
+    for tier in tiers:
+        data = tier_data[tier]
+        result = tier_results[tier]
+        color = TIER_COLORS.get(tier, '#888888')
+        dash = TIER_DASH_STYLES.get(tier, 'solid')
+        tier_label = f"T{tier}"
+
         if has_manual:
-            skel_speed = target.df.loc[mask_real, 'skeleton_speed'].values
+            mask_real = ~data.df['is_manual']
+            mask_manual = data.df['is_manual']
+            obs_hours = data.df.loc[mask_real, 'hours_elapsed'].values
+            obs_speed = data.df.loc[mask_real, 'norm_speed'].values
         else:
-            skel_speed = target.df['skeleton_speed'].values
-        if len(obs_time) == len(skel_speed):
-            fig.add_trace(
-                go.Scatter(
-                    x=obs_time, y=skel_speed,
-                    mode='markers',
-                    name='Observed Skeleton',
-                    marker=dict(color='lightgray', size=4),
-                    opacity=0.5,
-                    hovertemplate='%{x|%m-%d %H:%M}<br>Skeleton: %{y:.4f}<extra></extra>',
-                ),
-                row=1, col=1,
-            )
+            obs_hours = data.df['hours_elapsed'].values
+            obs_speed = data.df['norm_speed'].values
+        obs_time = _to_real_time(obs_hours, start_ts, tz_offset)
 
-    fig.add_trace(
-        go.Scatter(
-            x=pred_time, y=skeleton_y,
-            mode='lines',
-            name='Predicted Skeleton',
-            line=dict(color='blue', dash='dash', width=1),
-            opacity=0.6,
-            hovertemplate='%{x|%m-%d %H:%M}<br>Skeleton: %{y:.4f}<extra></extra>',
-        ),
-        row=1, col=1,
-    )
+        pred_time = _to_real_time(result.future_t, start_ts, tz_offset)
 
-    fig.add_trace(
-        go.Scatter(
-            x=obs_time, y=obs_speed,
-            mode='lines',
-            name='Observed Speed',
-            line=dict(color='red', width=2),
-            hovertemplate='%{x|%m-%d %H:%M}<br>Speed: %{y:.4f}<extra></extra>',
-        ),
-        row=1, col=1,
-    )
-
-    if len(manual_time_dt) > 0:
         fig.add_trace(
             go.Scatter(
-                x=manual_time_dt, y=manual_speed,
+                x=obs_time, y=obs_speed,
                 mode='lines',
-                name='Hypothetical Path',
-                line=dict(color='magenta', dash='dash', width=2),
-                opacity=0.7,
-                hovertemplate='%{x|%m-%d %H:%M}<br>Speed: %{y:.4f}<extra></extra>',
+                name=f'{tier_label} Speed',
+                line=dict(color=color, width=2),
+                legendgroup=f't{tier}',
+                hovertemplate=f'T{tier} Speed: %{{y:.4f}}<extra></extra>',
             ),
             row=1, col=1,
         )
 
-    fig.add_trace(
-        go.Scatter(
-            x=pred_time, y=result.future_speed,
-            mode='lines',
-            name='Predicted Speed',
-            line=dict(color='green', width=2),
-            opacity=0.8,
-            hovertemplate='%{x|%m-%d %H:%M}<br>Speed: %{y:.4f}<extra></extra>',
-        ),
-        row=1, col=1,
-    )
+        fig.add_trace(
+            go.Scatter(
+                x=pred_time, y=result.future_speed,
+                mode='lines',
+                name=f'{tier_label} Pred Speed',
+                line=dict(color=color, dash=dash, width=1.5),
+                opacity=0.7,
+                legendgroup=f't{tier}',
+                hovertemplate=f'T{tier} Pred Speed: %{{y:.4f}}<extra></extra>',
+            ),
+            row=1, col=1,
+        )
 
-    if target.full_df is not None:
-        full_df = target.full_df
-        mask_future = full_df['hours_elapsed'] > now_hours
-        if mask_future.any():
-            future_real_time = _to_real_time(
-                full_df.loc[mask_future, 'hours_elapsed'].values, start_ts, tz_offset
-            )
-            future_real_speed = full_df.loc[mask_future, 'norm_speed'].values
+    # 人工干预路径（只画一次，不区分层级）
+    if has_manual:
+        mask_manual = primary.df['is_manual']
+        manual_hours = primary.df.loc[mask_manual, 'hours_elapsed'].values
+        manual_speed = primary.df.loc[mask_manual, 'norm_speed'].values
+        if len(manual_hours) > 0:
+            manual_time_dt = _to_real_time(manual_hours, start_ts, tz_offset)
             fig.add_trace(
                 go.Scatter(
-                    x=future_real_time, y=future_real_speed,
+                    x=manual_time_dt, y=manual_speed,
                     mode='lines',
-                    name='Actual Future Speed',
-                    line=dict(color='orange', dash='dashdot', width=2),
-                    opacity=0.9,
-                    hovertemplate='%{x|%m-%d %H:%M}<br>Speed: %{y:.4f}<extra></extra>',
+                    name='Hypothetical Path',
+                    line=dict(color='magenta', dash='dash', width=2),
+                    opacity=0.7,
+                    hovertemplate='Hypothetical: %{y:.4f}<extra></extra>',
                 ),
                 row=1, col=1,
             )
 
-    # ========================================
-    # 面板 2: Score
-    # ========================================
-    fig.add_trace(
-        go.Scatter(
-            x=obs_time, y=obs_score,
-            mode='lines',
-            name='Observed Score',
-            line=dict(color='red', width=2),
-            hovertemplate='%{x|%m-%d %H:%M}<br>Score: %{y:,.0f}<extra></extra>',
-            legendgroup='score',
-            showlegend=True,
-        ),
-        row=2, col=1,
-    )
+    # ========== 面板 2: Score（各线叠加）==========
+    for tier in tiers:
+        data = tier_data[tier]
+        result = tier_results[tier]
+        color = TIER_COLORS.get(tier, '#888888')
+        dash = TIER_DASH_STYLES.get(tier, 'solid')
+        tier_label = f"T{tier}"
 
-    if len(manual_time_dt) > 0:
+        if has_manual:
+            mask_real = ~data.df['is_manual']
+            obs_hours = data.df.loc[mask_real, 'hours_elapsed'].values
+            obs_score = data.df.loc[mask_real, 'value'].values
+        else:
+            obs_hours = data.df['hours_elapsed'].values
+            obs_score = data.df['value'].values
+        obs_time = _to_real_time(obs_hours, start_ts, tz_offset)
+
+        full_time = _to_real_time(result.full_t_score, start_ts, tz_offset)
+
         fig.add_trace(
             go.Scatter(
-                x=manual_time_dt, y=manual_score,
+                x=obs_time, y=obs_score,
                 mode='lines',
-                name='Hypothetical Path',
-                line=dict(color='magenta', dash='dash', width=2),
-                opacity=0.7,
-                hovertemplate='%{x|%m-%d %H:%M}<br>Score: %{y:,.0f}<extra></extra>',
-                legendgroup='score',
-                showlegend=True,
+                name=f'{tier_label} Score',
+                line=dict(color=color, width=2),
+                legendgroup=f't{tier}',
+                hovertemplate=f'T{tier} Score: %{{y:,.0f}}<extra></extra>',
             ),
             row=2, col=1,
         )
+
+        fig.add_trace(
+            go.Scatter(
+                x=full_time, y=result.full_score,
+                mode='lines',
+                name=f'{tier_label} Pred Curve',
+                line=dict(color=color, dash=dash, width=2.5),
+                legendgroup=f't{tier}',
+                hovertemplate=f'T{tier} Pred: %{{y:,.0f}}<extra></extra>',
+            ),
+            row=2, col=1,
+        )
+
+        pred_final_time = _last(full_time)
+        pred_final_score = result.final_score
+
+        fig.add_annotation(
+            x=pred_final_time, y=pred_final_score,
+            text=f"<b>T{tier}: {int(pred_final_score):,}</b>",
+            showarrow=False,
+            font=dict(color=color, size=12),
+            xanchor='right',
+            yanchor='bottom',
+            row=2, col=1,
+        )
+
+    # 人工干预（分数面板，只画一次）
+    if has_manual:
+        manual_score = primary.df.loc[mask_manual, 'value'].values
+        if len(manual_hours) > 0:
+            manual_time_dt = _to_real_time(manual_hours, start_ts, tz_offset)
+            fig.add_trace(
+                go.Scatter(
+                    x=manual_time_dt, y=manual_score,
+                    mode='lines',
+                    name='Hypothetical Path',
+                    line=dict(color='magenta', dash='dash', width=2),
+                    opacity=0.7,
+                    hovertemplate='Hypothetical: %{y:,.0f}<extra></extra>',
+                    legendgroup='manual',
+                    showlegend=True,
+                ),
+                row=2, col=1,
+            )
         if manual_points:
             mp_hours = np.array([p['hours'] for p in manual_points])
             mp_scores = np.array([p['score'] for p in manual_points])
@@ -250,58 +249,60 @@ def plot_prediction_plotly(
                     mode='markers',
                     marker=dict(symbol='star', size=12, color='magenta'),
                     name='Manual Points',
-                    hovertemplate='%{x|%m-%d %H:%M}<br>Score: %{y:,.0f}<extra></extra>',
-                    legendgroup='score',
+                    hovertemplate='Manual: %{y:,.0f}<extra></extra>',
+                    legendgroup='manual',
                     showlegend=True,
                 ),
                 row=2, col=1,
             )
 
-    fig.add_trace(
-        go.Scatter(
-            x=full_time, y=result.full_score,
-            mode='lines',
-            name='Predicted Curve',
-            line=dict(color='purple', dash='dash', width=3),
-            hovertemplate='%{x|%m-%d %H:%M}<br>Score: %{y:,.0f}<extra></extra>',
-            legendgroup='score',
-            showlegend=True,
-        ),
-        row=2, col=1,
-    )
+    # 实际曲线（debug 模式，逐线绘制）
+    if debug_hours is not None:
+        for tier in tiers:
+            data = tier_data[tier]
+            if data.full_df is None or data.full_df.empty:
+                continue
+            color = TIER_COLORS.get(tier, '#888888')
+            full_df = data.full_df
+            full_real_time = _to_real_time(full_df['hours_elapsed'].values, start_ts, tz_offset)
+            fig.add_trace(
+                go.Scatter(
+                    x=full_real_time, y=full_df['value'],
+                    mode='lines',
+                    name=f'T{tier} Actual',
+                    line=dict(color=color, dash='dot', width=1.5),
+                    opacity=0.5,
+                    hovertemplate=f'T{tier} Actual: %{{y:,.0f}}<extra></extra>',
+                    legendgroup=f't{tier}',
+                    showlegend=True,
+                ),
+                row=2, col=1,
+            )
+            real_final_score = full_df.iloc[-1]['value']
+            real_final_time = _last(full_real_time)
+            fig.add_trace(
+                go.Scatter(
+                    x=[real_final_time], y=[real_final_score],
+                    mode='markers',
+                    name=f'T{tier} Actual Final',
+                    marker=dict(color=color, size=10, symbol='x'),
+                    hovertemplate=f'T{tier} Final: %{{y:,.0f}}<extra></extra>',
+                    legendgroup=f't{tier}',
+                    showlegend=True,
+                ),
+                row=2, col=1,
+            )
+            fig.add_annotation(
+                x=real_final_time, y=real_final_score,
+                text=f"<b>T{tier} Act: {int(real_final_score):,}</b>",
+                showarrow=False,
+                font=dict(color=color, size=11),
+                xanchor='right',
+                yanchor='top',
+                row=2, col=1,
+            )
 
-    if debug_hours is not None and target.full_df is not None and not target.full_df.empty:
-        full_df = target.full_df
-        full_real_time = _to_real_time(full_df['hours_elapsed'].values, start_ts, tz_offset)
-        fig.add_trace(
-            go.Scatter(
-                x=full_real_time, y=full_df['value'],
-                mode='lines',
-                name='Actual Curve',
-                line=dict(color='orange', width=2),
-                opacity=0.75,
-                hovertemplate='%{x|%m-%d %H:%M}<br>Score: %{y:,.0f}<extra></extra>',
-                legendgroup='score',
-                showlegend=True,
-            ),
-            row=2, col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[real_final_time], y=[real_final_score],
-                mode='markers',
-                name='Actual Final',
-                marker=dict(color='darkred', size=10),
-                hovertemplate='Actual Final<br>%{x|%m-%d %H:%M}<br>%{y:,.0f}<extra></extra>',
-                legendgroup='score',
-                showlegend=True,
-            ),
-            row=2, col=1,
-        )
-
-    # ========================================
-    # Now 竖线 — 用 shape yref=paper 贯穿双面板
-    # ========================================
+    # ===== Now 竖线 =====
     fig.add_shape(
         type='line',
         x0=now_dt, x1=now_dt, y0=0, y1=1,
@@ -316,62 +317,18 @@ def plot_prediction_plotly(
         yanchor='bottom',
     )
 
-    # ========================================
-    # 分数标注: Pred / Act / Error
-    # ========================================
-    fig.add_annotation(
-        x=pred_final_time, y=pred_final_score,
-        text=f"<b>Pred: {int(pred_final_score):,}</b>",
-        showarrow=False,
-        font=dict(color='purple', size=14),
-        xanchor='right',
-        yanchor='bottom',
-        row=2, col=1,
-    )
-
-    if real_final_score > 0:
-        offset_y = real_final_score
-        if abs(real_final_score - pred_final_score) < (pred_final_score * 0.15):
-            offset_y = min(0.8 * real_final_score, pred_final_score * 0.85)
-        fig.add_annotation(
-            x=real_final_time, y=offset_y,
-            text=f"<b>Act: {int(real_final_score):,}</b>",
-            showarrow=False,
-            font=dict(color='darkred', size=14),
-            xanchor='right',
-            yanchor='top',
-            row=2, col=1,
-        )
-
-        if error_val is not None:
-            error_label_y = max(pred_final_score, real_final_score) * 1.05
-            fig.add_annotation(
-                x=real_final_time, y=error_label_y,
-                text=f"<b>Error: {error_val:+,.0f}  /  {error_pct:+.1f}%</b>",
-                showarrow=False,
-                font=dict(color='black', size=13),
-                xanchor='right',
-                yanchor='bottom',
-                row=2, col=1,
-            )
-
-    # ========================================
-    # 水印
-    # ========================================
+    # ===== 水印 =====
     fig.add_annotation(
         x=1, y=0, xref='paper', yref='paper',
-        text='@byydzh mycx 1000',
+        text='@byydzh mycx multi',
         showarrow=False,
         font=dict(color='gray', size=10),
         opacity=0.6,
         xanchor='right', yanchor='bottom',
     )
 
-    # ========================================
-    # Layout
-    # ========================================
+    # ===== Layout =====
     fig.update_xaxes(rangeslider_visible=False, row=2, col=1)
-
     fig.update_yaxes(title_text="Normalized Speed", row=1, col=1)
     fig.update_yaxes(title_text="Event Points", row=2, col=1)
     fig.update_xaxes(title_text="Local Time", row=2, col=1)

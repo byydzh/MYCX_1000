@@ -42,9 +42,9 @@ class EventData:
     meta: EventMeta
     df: pd.DataFrame
     scale: float
+    tier: int = 1000
     window_intensity: Optional[float] = None
     fit_params: Optional[np.ndarray] = None
-    # [新增] 用于存储未截断的完整数据（上帝视角），默认为 None
     full_df: Optional[pd.DataFrame] = None 
 
     def __post_init__(self):

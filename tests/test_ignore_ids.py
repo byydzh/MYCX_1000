@@ -36,12 +36,13 @@ class TestIgnoreEventIds(unittest.TestCase):
 
         # 2. Mock fetch_event_data_pack to return valid dummy data for any ID
         # This ensures that if an ID is NOT ignored, it would be returned as a valid result
-        def side_effect_fetch(event_id):
+        def side_effect_fetch(event_id, tier=1000):
             return {
                 'event_id': event_id,
                 'meta': {'event_type': 'medley'},
-                'dataframe': MagicMock(), # Dummy DF
-                'scale': 1000.0
+                'dataframe': MagicMock(),
+                'scale': 1000.0,
+                'tier': tier,
             }
         
         # We need to patch the method on the instance or class. 

@@ -3,6 +3,7 @@ import logging
 import sys
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 引入所有组件
 from data_source import create_data_source
@@ -44,7 +45,8 @@ class PredictionPipeline:
         return EventData(
             meta=meta_obj,
             df=data_pack['dataframe'],
-            scale=data_pack['scale']
+            scale=data_pack['scale'],
+            tier=data_pack.get('tier', 1000),
         )
 
     def _calculate_derived_columns(self, event_data: EventData) -> EventData:
@@ -90,63 +92,109 @@ class PredictionPipeline:
         event_data.df = df
         return event_data
 
-    def run(self, target_event_id=None, debug_hours=None):
+    def _fetch_tier_data(self, tier, target_event_id, meta_raw, scale_val, event_type):
+        """在独立线程中获取单线数据（每个线程有自己的 ds 实例）"""
+        ds = create_data_source(self.config.get('api_source'))
+        try:
+            tier_pack = ds.fetch_event_data_pack(target_event_id, tier=tier, meta=meta_raw, scale=scale_val)
+            if not tier_pack:
+                return tier, None, None, "数据不可用"
+
+            similar_packs = ds.find_similar_events(
+                target_event_id, event_type,
+                count=self.config.get('similar_count', 5),
+                ignore_ids=self.config.get('ignore_event_ids', []),
+                tier=tier,
+            )
+            return tier, tier_pack, similar_packs, None
+        except Exception as e:
+            return tier, None, None, str(e)
+        finally:
+            ds.close()
+
+    def run(self, target_event_id=None, debug_hours=None, tiers=None):
+        if tiers is None:
+            tiers = [1000]
+
         logger.info("启动预测流水线...")
-        
+
         if target_event_id is None:
             target_event_id = self.data_source.get_current_event_id()
             if not target_event_id:
                 logger.error("无法自动获取当前活动 ID")
                 return
-        
-        logger.info(f"目标活动 ID: {target_event_id}")
 
-        target_pack = self.data_source.fetch_event_data_pack(target_event_id)
-        if not target_pack:
-            logger.error("无法获取目标活动数据")
+        logger.info(f"目标活动 ID: {target_event_id}, 层级: {tiers}")
+
+        # --- 预取共享资源 ---
+        meta_raw = self.data_source.fetch_event_meta(target_event_id)
+        if not meta_raw:
+            logger.error("无法获取目标活动元数据")
             return
-        
-        target_data = self._wrap_event_data(target_pack)
-        
-        # 先在完整数据上计算派生列 (speed, hours_elapsed)
-        target_data = self._calculate_derived_columns(target_data)
-        
-        # 保存一份完整数据的副本到 full_df
-        target_data.full_df = target_data.df.copy()
+        scale_val = self.data_source.fetch_top10_max_speed(target_event_id)
+        event_type = meta_raw.get('event_type', 'unknown')
+        self.data_source.fetch_events_index()  # 预热缓存
 
-        # 然后再进行截断，传给 Engine 的 df 是残缺的
-        if debug_hours:
-            limit_ts = target_data.meta.start_at + (debug_hours * 3600 * 1000)
-            target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()
-            logger.info(f"Debug 模式: 数据截断至 {debug_hours} 小时 (Full data retained in .full_df)")
+        # --- 并行获取各线数据 ---
+        tier_packs = {}
+        tier_similar = {}
+        max_workers = min(len(tiers), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._fetch_tier_data, tier, target_event_id, meta_raw, scale_val, event_type): tier
+                for tier in tiers
+            }
+            for f in as_completed(futures):
+                tier, pack, similar, err = f.result()
+                if err:
+                    logger.warning(f"T{tier}: {err}")
+                else:
+                    tier_packs[tier] = pack
+                    tier_similar[tier] = similar
 
-        logger.info(f"正在扫描同类活动 (Type: {target_data.meta.event_type})...")
-        similar_packs = self.data_source.find_similar_events(
-            target_event_id, target_data.meta.event_type, count=5
-        )
-        
-        history_events = []
-        for pack in similar_packs:
-            h_data = self._wrap_event_data(pack)
-            try:
-                h_data = self._calculate_derived_columns(h_data)
-                history_events.append(h_data)
-            except Exception as e:
-                logger.warning(f"跳过历史活动 {h_data.meta.event_id}: 数据异常 - {e}")
+        # --- 顺序执行预测（CPU 密集，无需并行）---
+        tier_results = {}
+        for tier in tiers:
+            if tier not in tier_packs:
+                continue
+            logger.info(f"--- 处理 T{tier} ---")
 
-        logger.info(f"找到 {len(history_events)} 个有效历史活动用于对比")
+            target_data = self._wrap_event_data(tier_packs[tier])
+            target_data = self._calculate_derived_columns(target_data)
+            target_data.full_df = target_data.df.copy()
 
-        logger.info("开始核心计算...")
-        result = self.engine.predict(target_data, history_events, debug_hours=debug_hours)
-        
-        logger.info(f"预测完成! 最终预测分数: {int(result.final_score):,}")
-        logger.info(f"使用的修正系数 (Ratio): {result.ratio:.4f}")
+            if debug_hours:
+                limit_ts = target_data.meta.start_at + (debug_hours * 3600 * 1000)
+                target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()
+
+            history_events = []
+            for pack in tier_similar.get(tier, []):
+                h_data = self._wrap_event_data(pack)
+                try:
+                    h_data = self._calculate_derived_columns(h_data)
+                    history_events.append(h_data)
+                except Exception as e:
+                    logger.warning(f"跳过历史活动 {h_data.meta.event_id}: {e}")
+
+            logger.info(f"找到 {len(history_events)} 个有效历史活动 T{tier}")
+
+            result = self.engine.predict(target_data, history_events, debug_hours=debug_hours)
+            tier_results[tier] = result
+            logger.info(f"T{tier} 预测完成: {int(result.final_score):,} (Ratio: {result.ratio:.4f})")
 
         logger.info("正在绘图...")
-        self.visualizer.plot_prediction(target_data, result, debug_hours=debug_hours)
-        
+        if tier_results:
+            first_tier = next(iter(tier_results))
+            first_target = tier_packs.get(first_tier)
+            if first_target:
+                target_data = self._wrap_event_data(first_target)
+                target_data = self._calculate_derived_columns(target_data)
+                self.visualizer.plot_prediction(target_data, tier_results[first_tier],
+                                                debug_hours=debug_hours)
+
         self.data_source.close()
         logger.info("流水线运行结束 喵！")
+        return tier_results
 
 if __name__ == "__main__":
     import argparse
@@ -158,16 +206,20 @@ if __name__ == "__main__":
         choices=sorted(API_SOURCE_CONFIGS.keys()),
         help='API source profile'
     )
+    parser.add_argument(
+        '--tiers', '-t',
+        type=str,
+        default='1000',
+        help='Comma-separated tier numbers, e.g. "500,1000,1500,2000" (default: 1000)'
+    )
     args = parser.parse_args()
 
     runtime_config = DEFAULT_CONFIG.copy()
     if args.api_source:
         runtime_config['api_source'] = args.api_source
 
+    tiers = [int(x.strip()) for x in args.tiers.split(',')]
+
     pipeline = PredictionPipeline(config=runtime_config)
     
-    if args.event_id:
-        pipeline.run(target_event_id=args.event_id, debug_hours=args.debug_hours)
-    else:
-        # 默认行为
-        pipeline.run()
+    pipeline.run(target_event_id=args.event_id, debug_hours=args.debug_hours, tiers=tiers)

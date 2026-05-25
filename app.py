@@ -12,6 +12,7 @@ import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import API_SOURCE_CONFIGS, DEFAULT_CONFIG, list_models, list_presets, load_preset
 from data_source import create_data_source
@@ -33,7 +34,8 @@ def wrap_event_data(data_pack) -> EventData:
     return EventData(
         meta=meta_obj,
         df=data_pack['dataframe'],
-        scale=data_pack['scale']
+        scale=data_pack['scale'],
+        tier=data_pack.get('tier', 1000),
     )
 
 def calculate_derived_columns(event_data: EventData) -> EventData:
@@ -178,6 +180,14 @@ if 'current_event_id' not in st.session_state:
     st.session_state['current_event_id'] = None
 if 'is_debug_mode' not in st.session_state:
     st.session_state['is_debug_mode'] = False
+if 'tier_results' not in st.session_state:
+    st.session_state['tier_results'] = {}
+if 'tier_targets' not in st.session_state:
+    st.session_state['tier_targets'] = {}
+if 'tier_errors' not in st.session_state:
+    st.session_state['tier_errors'] = {}
+if 'selected_tiers' not in st.session_state:
+    st.session_state['selected_tiers'] = [500, 1000, 1500, 2000]
 
 # ==========================================
 # 3. 侧边栏控制
@@ -238,6 +248,15 @@ if selected_preset_meta.get("description"):
 current_signature = f"{selected_model}:{selected_preset}"
 if st.session_state.get(PRESET_SIGNATURE_KEY) != current_signature:
     _apply_preset_to_session(selected_model, selected_preset)
+
+ALL_TIERS = [500, 1000, 1500, 2000]
+selected_tiers = st.sidebar.multiselect(
+    "预测榜线",
+    options=ALL_TIERS,
+    default=st.session_state.get('selected_tiers', ALL_TIERS),
+    format_func=lambda t: f"T{t}",
+    key='selected_tiers',
+)
 
 manual_btn = st.sidebar.button("⚡ 立即运行预测", type="primary")
 
@@ -566,31 +585,27 @@ if should_run:
                 target_eid = int(debug_event_id)
             else:
                 target_eid = ds.get_current_event_id()
-            
+
             if not target_eid:
                 st.error("无法获取当前活动 ID，请检查网络或手动指定。")
+            elif not selected_tiers:
+                st.warning("请至少选择一个榜线。")
             else:
-                # 2. 获取目标数据
-                target_pack = ds.fetch_event_data_pack(target_eid)
-                if not target_pack:
-                    st.error(f"无法获取活动 {target_eid} 的详细数据。")
+                # --- 先获取 meta（全局共享）---
+                meta_raw = ds.fetch_event_meta(target_eid)
+                if not meta_raw:
+                    st.error(f"无法获取活动 {target_eid} 的元数据。")
                 else:
-                    target_data = wrap_event_data(target_pack)
-                    target_data = calculate_derived_columns(target_data)
-                    target_data.full_df = target_data.df.copy() # 保存上帝视角副本
-
-                    # --- 时间解析与转换逻辑 ---
-                    start_ts = target_data.meta.start_at
+                    meta_obj = EventMeta.from_dict(target_eid, meta_raw)
+                    start_ts = meta_obj.start_at
                     tz_utc8 = timezone(timedelta(hours=8))
-                    
-                    # A. 处理冻结时间
+
+                    # --- 时间解析与转换（共享）---
                     target_debug_h = None
                     if enable_debug and not use_max_time and debug_freeze_str:
-                        # 1. 尝试解析为纯数字 (相对小时)
                         try:
                             target_debug_h = float(debug_freeze_str)
                         except ValueError:
-                            # 2. 尝试解析为 UTC+8 时间字符串
                             try:
                                 for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
                                     try:
@@ -600,24 +615,20 @@ if should_run:
                                         continue
                                 else:
                                     raise ValueError("无法识别的时间格式")
-                                    
                                 dt_freeze = dt_freeze.replace(tzinfo=tz_utc8)
                                 ts_freeze = dt_freeze.timestamp() * 1000
                                 target_debug_h = (ts_freeze - start_ts) / 3600000.0
                             except Exception as e:
-                                st.error(f"冻结时间解析失败: {e}，将使用最大观测时间")
+                                st.error(f"冻结时间解析失败: {e}")
                                 target_debug_h = None
-                        
                         if target_debug_h is not None and target_debug_h < 0:
-                            st.warning("冻结时间早于活动开始时间，将使用 0.0 小时")
                             target_debug_h = 0.0
 
-                    # B. 处理人工干预点
+                    # --- 人工干预点解析（共享）---
                     manual_points = []
                     if manual_points_raw:
                         for mp in manual_points_raw:
                             try:
-                                # 同样尝试解析时间
                                 t_str = mp['time_str']
                                 for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
                                     try:
@@ -626,81 +637,15 @@ if should_run:
                                     except ValueError:
                                         continue
                                 else:
-                                    st.warning(f"跳过无法解析的时间: {t_str}")
                                     continue
-                                
                                 dt_mp = dt_mp.replace(tzinfo=tz_utc8)
                                 ts_mp = dt_mp.timestamp() * 1000
                                 h_mp = (ts_mp - start_ts) / 3600000.0
-                                
                                 manual_points.append({'hours': h_mp, 'score': mp['score']})
-                            except Exception as e:
-                                st.warning(f"处理干预点出错: {mp} - {e}")
+                            except Exception:
+                                pass
 
-                    # --- 异常输入检查 (仅警告) ---
-                    if manual_points:
-                        # 1. 检查时间范围
-                        total_h = target_data.meta.total_hours
-                        for mp in manual_points:
-                            if mp['hours'] < 0 or mp['hours'] > total_h:
-                                st.warning(f"⚠️ 警告: 干预点时间 {mp['hours']:.1f}h 超出活动范围 (0~{total_h}h)")
-                        
-                        # 2. 检查分数倒退 (负速度)
-                        # 需要结合当前最新数据
-                        current_max_score = target_data.df['value'].max()
-                        current_max_time = target_data.df['hours_elapsed'].max()
-                        
-                        # 按时间排序
-                        sorted_mps = sorted(manual_points, key=lambda x: x['hours'])
-                        
-                        last_s = current_max_score
-                        last_t = current_max_time
-                        
-                        for mp in sorted_mps:
-                            if mp['hours'] <= last_t:
-                                st.warning(f"⚠️ 警告: 干预点时间 {mp['hours']:.1f}h 早于或等于前一个点 ({last_t:.1f}h)，将被忽略")
-                                continue
-                                
-                            if mp['score'] < last_s:
-                                st.warning(f"⚠️ 警告: 干预点分数 {int(mp['score'])} 低于前一个点 ({int(last_s)})，意味着负增长")
-                            
-                            # 3. 检查超高速
-                            # 粗略计算一下平均速度
-                            delta_s = mp['score'] - last_s
-                            delta_t = mp['hours'] - last_t
-                            if delta_t > 0:
-                                speed_val = delta_s / delta_t
-                                # 归一化速度 > 1.0 意味着超过了理论最大速度 (scale)
-                                if target_data.scale > 0:
-                                    norm_spd = (speed_val / 60.0) / target_data.scale
-                                    if norm_spd > 1.0:
-                                        st.warning(f"⚠️ 警告: 干预区间速度超过理论极限 (Norm Speed ≈ {norm_spd:.2f} > 1.0)，请检查输入")
-
-                            last_s = mp['score']
-                            last_t = mp['hours']
-                    # ---------------------------
-
-                    # 截断逻辑
-                    if target_debug_h is not None:
-                        limit_ts = target_data.meta.start_at + (target_debug_h * 3600 * 1000)
-                        target_data.df = target_data.df[target_data.df['time'] <= limit_ts].copy()
-
-                    # 3. 获取历史数据
-                    similar_packs = ds.find_similar_events(
-                        target_eid,
-                        target_data.meta.event_type,
-                        count=int(current_config.get('similar_count', similar_count)),
-                        ignore_ids=current_config.get('ignore_event_ids', ignore_ids)
-                    )
-                    history_events = []
-                    for pack in similar_packs:
-                        h_data = wrap_event_data(pack)
-                        try:
-                            h_data = calculate_derived_columns(h_data)
-                            history_events.append(h_data)
-                        except: pass
-                    
-                    # 4. 初始化引擎组件
+                    # --- 初始化引擎组件（所有层级共享）---
                     seasonality = SeasonalityHandler(
                         weekend_multiplier=float(current_config.get('weekend_multiplier', weekend_mult)),
                         panic_scaler=float(current_config.get('panic_scaler', panic_scaler)),
@@ -709,38 +654,114 @@ if should_run:
                     modeler = CosineModeler()
                     engine = PredictionEngine(seasonality, modeler, config=current_config)
 
-                    # 5. 执行预测
-                    result = engine.predict(
-                        target_data,
-                        history_events,
-                        debug_hours=target_debug_h,
-                        manual_points=manual_points
-                    )
+                    # --- 预取共享资源 ---
+                    event_type = meta_raw.get('event_type', 'unknown')
+                    scale_val = ds.fetch_top10_max_speed(target_eid)
+                    ds.fetch_events_index()  # 预热缓存
 
-                    # 6. 绘图 (Plotly 交互式)
-                    fig = plot_prediction_plotly(
-                        target_data,
-                        result,
-                        debug_hours=target_debug_h,
-                        manual_points=manual_points,
-                    )
-                    st.session_state['img_bytes'] = fig
-                    st.session_state['current_score'] = int(result.future_score[0]) if len(result.future_score) > 0 else 0
-                    st.session_state['predicted_score'] = int(result.final_score)
+                    # --- 并行获取各线数据 ---
+                    def _fetch_one_tier(tier):
+                        tds = create_data_source(current_config.get('api_source'))
+                        try:
+                            tp = tds.fetch_event_data_pack(target_eid, tier=tier, meta=meta_raw, scale=scale_val)
+                            if not tp:
+                                return tier, None, None, "数据不可用"
+                            sp = tds.find_similar_events(
+                                target_eid, event_type,
+                                count=int(current_config.get('similar_count', similar_count)),
+                                ignore_ids=current_config.get('ignore_event_ids', ignore_ids),
+                                tier=tier,
+                            )
+                            return tier, tp, sp, None
+                        except Exception as exc:
+                            return tier, None, None, str(exc)
+                        finally:
+                            tds.close()
+
+                    tier_packs = {}
+                    tier_similar = {}
+                    tier_errors_dict = {}
+                    max_workers = min(len(selected_tiers), 4)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {executor.submit(_fetch_one_tier, t): t for t in selected_tiers}
+                        for f in as_completed(futures):
+                            tier, tp, sp, err = f.result()
+                            if err:
+                                tier_errors_dict[tier] = err
+                            else:
+                                tier_packs[tier] = tp
+                                tier_similar[tier] = sp
+
+                    # --- 顺序执行预测 ---
+                    tier_data_dict = {}
+                    tier_results_dict = {}
+
+                    for tier in selected_tiers:
+                        if tier not in tier_packs:
+                            if tier not in tier_errors_dict:
+                                tier_errors_dict[tier] = "数据不可用"
+                            continue
+
+                        tier_target = wrap_event_data(tier_packs[tier])
+                        try:
+                            tier_target = calculate_derived_columns(tier_target)
+                        except Exception:
+                            tier_errors_dict[tier] = "数据异常"
+                            continue
+
+                        tier_target.full_df = tier_target.df.copy()
+
+                        if target_debug_h is not None:
+                            limit_ts = tier_target.meta.start_at + (target_debug_h * 3600 * 1000)
+                            tier_target.df = tier_target.df[tier_target.df['time'] <= limit_ts].copy()
+
+                        history_events = []
+                        for pack in tier_similar.get(tier, []):
+                            h_data = wrap_event_data(pack)
+                            try:
+                                h_data = calculate_derived_columns(h_data)
+                                history_events.append(h_data)
+                            except Exception:
+                                pass
+
+                        try:
+                            result = engine.predict(
+                                tier_target, history_events,
+                                debug_hours=target_debug_h,
+                                manual_points=manual_points
+                            )
+                        except Exception as e:
+                            tier_errors_dict[tier] = f"预测失败: {e}"
+                            continue
+
+                        tier_data_dict[tier] = tier_target
+                        tier_results_dict[tier] = result
+
+                    # --- 绘图 ---
+                    if tier_data_dict:
+                        fig = plot_prediction_plotly(
+                            tier_data_dict,
+                            tier_results_dict,
+                            debug_hours=target_debug_h,
+                            manual_points=manual_points,
+                        )
+                        st.session_state['img_bytes'] = fig
+                    else:
+                        st.session_state['img_bytes'] = None
+
+                    st.session_state['tier_results'] = tier_results_dict
+                    st.session_state['tier_targets'] = tier_data_dict
+                    st.session_state['tier_errors'] = tier_errors_dict
                     st.session_state['current_event_id'] = target_eid
                     st.session_state['is_debug_mode'] = enable_debug
-                    st.session_state['actual_score'] = (
-                        int(target_data.full_df.iloc[-1]['value'])
-                        if enable_debug and target_data.full_df is not None and not target_data.full_df.empty
-                        else None
-                    )
-                    
+
                     # 更新时间
                     beijing_tz = timezone(timedelta(hours=8))
                     st.session_state['last_update_str'] = datetime.now(beijing_tz).strftime('%H:%M:%S')
-                    
+
                     if manual_btn:
-                        st.success(f"预测完成！Event {target_eid} | Final: {int(result.final_score):,}")
+                        passed = len(tier_results_dict)
+                        st.success(f"预测完成！Event {target_eid} | {passed}/{len(selected_tiers)} 线成功")
 
         except Exception as e:
             st.error(f"运行出错: {str(e)}")
@@ -755,17 +776,22 @@ col_img, col_info = st.columns([3, 1])
 
 with col_img:
     if st.session_state['img_bytes']:
-        cur = st.session_state.get('current_score')
-        pred = st.session_state.get('predicted_score')
-        actual = st.session_state.get('actual_score')
+        tier_results = st.session_state.get('tier_results', {})
+        tier_targets = st.session_state.get('tier_targets', {})
+        tier_errors = st.session_state.get('tier_errors', {})
 
-        if cur is not None and pred is not None:
-            score_text = f"当前: **{cur:,}**  |  预测最终: **{pred:,}**"
-            if actual is not None:
-                err = pred - actual
-                err_pct = err / actual * 100
-                score_text += f"  |  实际: **{actual:,}**  |  误差: **{err:+,} ({err_pct:+.1f}%)**"
-            st.markdown(score_text)
+        score_parts = []
+        for tier in sorted(tier_results.keys()):
+            r = tier_results[tier]
+            t = tier_targets.get(tier)
+            cur = int(t.df['value'].max()) if t is not None and not t.df.empty else 0
+            score_parts.append(f"T{tier}: 当前 **{cur:,}** → 预测 **{int(r.final_score):,}**")
+
+        for tier in sorted(tier_errors.keys()):
+            score_parts.append(f"T{tier}: ⚠ {tier_errors[tier]}")
+
+        if score_parts:
+            st.markdown("  |  ".join(score_parts))
 
         st.plotly_chart(
             st.session_state['img_bytes'],
@@ -789,7 +815,12 @@ with col_img:
         )
         st.caption(f"更新于: {st.session_state['last_update_str']}")
     else:
-        st.info("🐱 暂无数据，正在等待初始化或手动触发...")
+        tier_errors = st.session_state.get('tier_errors', {})
+        if tier_errors:
+            for tier, err in tier_errors.items():
+                st.warning(f"T{tier}: {err}")
+        else:
+            st.info("🐱 暂无数据，正在等待初始化或手动触发...")
 
 with col_info:
     st.markdown("### 状态面板")
