@@ -24,6 +24,8 @@
 !math_models.py
 !visualizer.py
 !plotly_viz.py
+!tier_surface.py
+!graph_engine.py
 !main_pipeline.py
 !tuner
 !tuner/*.py
@@ -32,3 +34,9 @@
 # Config presets
 !configs
 !configs/**
+
+# Runtime graph-model assets required by graph_engine.py
+!event_data
+!event_data/tier_speed_profiles_last100.json
+!event_data/song_rank_shape_event311.json
+!event_data/graph_behavior_prior_rollout_multitier_baseline.json

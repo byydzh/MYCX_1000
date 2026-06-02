@@ -8,6 +8,8 @@ from typing import Dict, List, Optional
 DEFAULT_SERVER = 3  # 国服
 DEFAULT_API_SOURCE = "hhwx"
 
+ALL_TRACKER_TIERS = [10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000, 1500, 2000, 3000, 4000, 5000]
+
 API_SOURCE_CONFIGS = {
     "hhwx": {
         "label": "HHWX Tracker Proxy",
