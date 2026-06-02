@@ -300,7 +300,7 @@ class PredictionEngine:
         R_MAX = float(self.config.get('ratio_max', 4.0))
         return float(np.clip(chosen_ratio, R_MIN, R_MAX))
 
-    def _fit_history_params(self, history: List[EventData]) -> np.ndarray:
+    def _fit_history_params(self, history: List[EventData]) -> Optional[np.ndarray]:
         """拟合历史参数"""
         hist_params = []
         for h in history:
@@ -320,7 +320,7 @@ class PredictionEngine:
                     pass
         
         if not hist_params:
-            return np.array([0.05, 0.001, 0.0, 0.5, 24.0])
+            return None
         return np.mean(hist_params, axis=0)
 
     def _refit_shape_params(self, target: EventData, initial_params: np.ndarray) -> np.ndarray:
@@ -766,6 +766,8 @@ class PredictionEngine:
 
         # 3. 获取并修正参数
         avg_params = self._fit_history_params(history)
+        if avg_params is None:
+            raise ValueError("缺少有效历史先验，Skeleton+KF baseline 不应输出固定默认预测。")
         pred_params = avg_params.copy()
         pred_params = self._apply_duration_param_alignment(pred_params, target, history)
 

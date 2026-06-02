@@ -1069,6 +1069,7 @@ if should_run:
                     tier_packs = {}
                     tier_similar = {}
                     tier_errors_dict = {}
+                    tier_warnings_dict = {}
                     max_workers = min(len(selected_tiers), 4)
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {executor.submit(_fetch_one_tier, t): t for t in selected_tiers}
@@ -1106,6 +1107,13 @@ if should_run:
 
                         history_events = []
                         for pack in tier_similar.get(tier, []):
+                            if pack.get('is_interpolated_tier'):
+                                source_tiers = pack.get('interpolated_from_tiers') or []
+                                if source_tiers:
+                                    tier_warnings_dict[tier] = (
+                                        f"历史先验缺失，使用 T{source_tiers[0]}/T{source_tiers[1]} "
+                                        f"相邻榜线合成 baseline"
+                                    )
                             h_data = wrap_event_data(pack)
                             try:
                                 h_data = calculate_derived_columns(h_data)
@@ -1248,6 +1256,7 @@ if should_run:
                     st.session_state['tier_results'] = tier_results_dict
                     st.session_state['tier_targets'] = tier_data_dict
                     st.session_state['tier_errors'] = tier_errors_dict
+                    st.session_state['tier_warnings'] = tier_warnings_dict
                     st.session_state['current_event_id'] = target_eid
                     st.session_state['is_debug_mode'] = enable_debug
                     run_timings["总计"] = time.perf_counter() - timing_state['start']
@@ -1282,6 +1291,7 @@ with col_img:
         tier_results = st.session_state.get('tier_results', {})
         tier_targets = st.session_state.get('tier_targets', {})
         tier_errors = st.session_state.get('tier_errors', {})
+        tier_warnings = st.session_state.get('tier_warnings', {})
 
         score_parts = []
         for tier in sorted(tier_results.keys()):
@@ -1292,6 +1302,9 @@ with col_img:
 
         for tier in sorted(tier_errors.keys()):
             score_parts.append(f"T{tier}: ⚠ {tier_errors[tier]}")
+
+        for tier in sorted(tier_warnings.keys()):
+            score_parts.append(f"T{tier}: ⚠ {tier_warnings[tier]}")
 
         if score_parts:
             st.markdown("  |  ".join(score_parts))

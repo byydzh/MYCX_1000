@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
-from config import API_SOURCE_CONFIGS, DEFAULT_API_SOURCE, DEFAULT_SERVER
+from config import API_SOURCE_CONFIGS, DEFAULT_API_SOURCE, DEFAULT_SERVER, ALL_TRACKER_TIERS
 
 logger = logging.getLogger('predictor.datasource')
 
@@ -315,6 +315,117 @@ class BandoriDataSource:
 
     def fetch_tier_1000_data(self, event_id, tier=1000):
         return self.fetch_tier_data(event_id, tier=tier)
+
+    def _get_adjacent_tracker_tiers(self, tier):
+        tier = int(tier)
+        tiers = sorted(int(t) for t in ALL_TRACKER_TIERS)
+        lower = [t for t in tiers if t < tier]
+        upper = [t for t in tiers if t > tier]
+        if not lower or not upper:
+            return None
+        return max(lower), min(upper)
+
+    @staticmethod
+    def _score_column(df):
+        for column in ("value", "ep", "points", "score", "pt"):
+            if column in df.columns:
+                return column
+        return None
+
+    def _interpolate_tier_dataframe(self, lower_df, upper_df, lower_tier, target_tier, upper_tier):
+        """
+        用相邻实际榜线构造缺失 tier 的历史曲线。
+        这是 baseline 模型的显式历史 fallback，不是固定参数兜底。
+        """
+        if lower_df is None or upper_df is None or lower_df.empty or upper_df.empty:
+            return None
+
+        lower_col = self._score_column(lower_df)
+        upper_col = self._score_column(upper_df)
+        if lower_col is None or upper_col is None or "time" not in lower_df.columns or "time" not in upper_df.columns:
+            return None
+
+        left = lower_df[["time", lower_col]].rename(columns={lower_col: "lower_value"}).copy()
+        right = upper_df[["time", upper_col]].rename(columns={upper_col: "upper_value"}).copy()
+        left["time"] = pd.to_numeric(left["time"], errors="coerce")
+        right["time"] = pd.to_numeric(right["time"], errors="coerce")
+        left["lower_value"] = pd.to_numeric(left["lower_value"], errors="coerce")
+        right["upper_value"] = pd.to_numeric(right["upper_value"], errors="coerce")
+        left = left.dropna().sort_values("time")
+        right = right.dropna().sort_values("time")
+        if left.empty or right.empty:
+            return None
+
+        merged = pd.merge_asof(
+            left,
+            right,
+            on="time",
+            direction="nearest",
+            tolerance=3600000,
+        ).dropna()
+        if merged.empty:
+            return None
+
+        lower_tier = float(lower_tier)
+        target_tier = float(target_tier)
+        upper_tier = float(upper_tier)
+        if lower_tier <= 0 or target_tier <= lower_tier or upper_tier <= target_tier:
+            return None
+
+        rank_weight = float(np.log(target_tier / lower_tier) / np.log(upper_tier / lower_tier))
+        merged["value"] = (
+            merged["lower_value"] * (1.0 - rank_weight)
+            + merged["upper_value"] * rank_weight
+        )
+        merged["value"] = merged["value"].clip(lower=0.0)
+        return merged[["time", "value"]].copy()
+
+    def fetch_interpolated_tier_data_pack(
+        self,
+        event_id,
+        tier,
+        allow_scale_fallback=True,
+        scale_primary_timeout=2,
+        scale_fallback_timeout=2,
+        scale_primary_retry=False,
+        scale_fallback_retry=False,
+    ):
+        neighbors = self._get_adjacent_tracker_tiers(tier)
+        if neighbors is None:
+            return None
+        lower_tier, upper_tier = neighbors
+
+        meta = self.fetch_event_meta(event_id)
+        if not meta:
+            return None
+
+        lower_df = self.fetch_tier_data(event_id, lower_tier)
+        upper_df = self.fetch_tier_data(event_id, upper_tier)
+        df = self._interpolate_tier_dataframe(lower_df, upper_df, lower_tier, tier, upper_tier)
+        if df is None or df.empty:
+            return None
+
+        scale = self.fetch_top10_max_speed(
+            event_id,
+            allow_fallback=allow_scale_fallback,
+            primary_timeout=scale_primary_timeout,
+            fallback_timeout=scale_fallback_timeout,
+            primary_retry=scale_primary_retry,
+            fallback_retry=scale_fallback_retry,
+            suppress_fallback_log=True,
+        )
+        if scale is None or scale <= 0:
+            return None
+
+        return {
+            "event_id": event_id,
+            "meta": meta,
+            "dataframe": df,
+            "scale": scale,
+            "tier": int(tier),
+            "is_interpolated_tier": True,
+            "interpolated_from_tiers": [int(lower_tier), int(upper_tier)],
+        }
 
     def fetch_all_tier_data(self, event_id, tiers=None):
         """
@@ -636,6 +747,39 @@ class BandoriDataSource:
             self._default_suppress_scale_failure_log = old_suppress_failure
 
         results.sort(key=lambda item: item['event_id'], reverse=True)
+        if len(results) < count:
+            existing_event_ids = {int(item['event_id']) for item in results}
+            fallback_candidates = [
+                eid for eid in candidates[:scan_limit]
+                if int(eid) not in existing_event_ids
+            ]
+            fallback_results = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_eid = {
+                    executor.submit(
+                        self.fetch_interpolated_tier_data_pack,
+                        eid,
+                        tier,
+                        allow_scale_fallback=allow_scale_fallback,
+                        scale_primary_timeout=scale_primary_timeout,
+                        scale_fallback_timeout=scale_fallback_timeout,
+                        scale_primary_retry=scale_primary_retry,
+                        scale_fallback_retry=scale_fallback_retry,
+                    ): eid
+                    for eid in fallback_candidates
+                }
+                for future in as_completed(future_to_eid):
+                    try:
+                        data_pack = future.result()
+                        if data_pack and data_pack['scale'] and data_pack['scale'] > 0:
+                            if data_pack['meta'].get('event_type') == event_type:
+                                fallback_results.append(data_pack)
+                    except Exception:
+                        pass
+            if fallback_results:
+                fallback_results.sort(key=lambda item: item['event_id'], reverse=True)
+                results.extend(fallback_results[: max(0, count - len(results))])
+                results.sort(key=lambda item: item['event_id'], reverse=True)
         return results[:count]
 
 

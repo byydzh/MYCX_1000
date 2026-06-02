@@ -140,8 +140,12 @@ class CosineModeler:
     def fit(self, t, y, total_hours):
         p0 = [0.05, 0.001, 0.00001, 0.5, 24.0]
         bounds = ([0, -0.01, -0.001, 0, 6], [1, 0.01, 0.001, 10, min(72, total_hours/2)])
-        try:
-            popt, _ = curve_fit(lambda t_val, *p: self.shape_function(t_val, *p, total_hours), 
-                                t, y, p0=p0, bounds=bounds, maxfev=40000)
-            return popt
-        except: return np.array(p0)
+        popt, _ = curve_fit(
+            lambda t_val, *p: self.shape_function(t_val, *p, total_hours),
+            t,
+            y,
+            p0=p0,
+            bounds=bounds,
+            maxfev=40000,
+        )
+        return popt

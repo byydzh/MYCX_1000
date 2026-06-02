@@ -178,7 +178,11 @@ class PredictionPipeline:
 
             logger.info(f"找到 {len(history_events)} 个有效历史活动 T{tier}")
 
-            result = self.engine.predict(target_data, history_events, debug_hours=debug_hours)
+            try:
+                result = self.engine.predict(target_data, history_events, debug_hours=debug_hours)
+            except Exception as e:
+                logger.warning(f"T{tier} 预测失败: {e}")
+                continue
             tier_results[tier] = result
             logger.info(f"T{tier} 预测完成: {int(result.final_score):,} (Ratio: {result.ratio:.4f})")
 
