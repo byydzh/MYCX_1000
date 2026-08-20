@@ -7,6 +7,9 @@
 # Allow files
 !predictor.py
 !base_distribution.py
+!behavior_pace_model.py
+!behavior_pace_prior.py
+!BEHAVIOR_MODEL_THEORY.md
 !app.py
 !config.py
 !config_learning.py
@@ -25,18 +28,26 @@
 !visualizer.py
 !plotly_viz.py
 !tier_surface.py
-!graph_engine.py
 !main_pipeline.py
 !tuner
 !tuner/*.py
 !tuner/*.ipynb
 
-# Config presets
-!configs
-!configs/**
+# Reusable data-analysis entrypoints.
+!scripts
+!scripts/collect_tier_surface_cache.py
+!scripts/evaluate_reward_tiers_318_319.py
 
-# Runtime graph-model assets required by graph_engine.py
+# Pace-model frozen prior only; legacy behavior protocols stay ignored.
+!configs/
+configs/*
+!configs/models/
+!configs/models/**
+!configs/behavior_model/
+configs/behavior_model/*
+!configs/behavior_model/pace_prior_train192_283.json
+
+# Reusable multi-rank data assets.
 !event_data
 !event_data/tier_speed_profiles_last100.json
 !event_data/song_rank_shape_event311.json
-!event_data/graph_behavior_prior_rollout_multitier_baseline.json
