@@ -1,4 +1,5 @@
 import json
+import numbers
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -7,14 +8,61 @@ from typing import Dict, List, Optional
 # ==========================================
 DEFAULT_SERVER = 3  # 国服
 DEFAULT_API_SOURCE = "hhwx"
+DEFAULT_FALLBACK_API_SOURCE = "bestdori"
 
-ALL_TRACKER_TIERS = [10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000, 1500, 2000, 3000, 4000, 5000]
+# HHWX 的实时 tracker 按分钟级刷新。实时缓存只用于合并同一轮
+# Streamlit 重复请求，不能跨越下一个刷新窗口。
+EVENTS_INDEX_CACHE_TTL_SECONDS = 60.0
+LIVE_SCALE_CACHE_TTL_SECONDS = 60.0
+
+# Public tracker contract shared by this project and the HHWX fixed-tier list.
+# Individual events may expose only a subset; rank is not a continuous query.
+ALL_TRACKER_TIERS = [
+    1, 10, 20, 30, 40, 50, 100, 200, 300, 400, 500,
+    1000, 1500, 2000, 3000, 4000, 5000,
+    10000, 20000, 30000, 40000, 50000, 70000, 100000,
+]
+TRACKER_TIER_SET = frozenset(ALL_TRACKER_TIERS)
+
+
+def validate_tracker_tier(tier: int) -> int:
+    """Return a supported public tracker tier, or fail before any HTTP call."""
+    if isinstance(tier, bool):
+        raise ValueError(f"Tracker tier must be an integer, got {tier!r}")
+    if isinstance(tier, numbers.Integral):
+        normalized = int(tier)
+    elif isinstance(tier, str):
+        text = tier.strip()
+        if not text.isdecimal() or str(int(text)) != text:
+            raise ValueError(
+                f"Tracker tier must be a canonical integer, got {tier!r}"
+            )
+        normalized = int(text)
+    else:
+        raise ValueError(f"Tracker tier must be an integer, got {tier!r}")
+    if normalized not in TRACKER_TIER_SET:
+        raise ValueError(
+            f"Unsupported tracker tier T{normalized}. Public APIs only expose "
+            f"fixed tiers: {ALL_TRACKER_TIERS}"
+        )
+    return normalized
+
+
+def canonicalize_tracker_tiers(tiers) -> list[int]:
+    """Validate a tier collection and return it in the public-contract order."""
+    if tiers is None:
+        return list(ALL_TRACKER_TIERS)
+    requested = [validate_tracker_tier(tier) for tier in tiers]
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"Duplicate tracker tier request: {requested}")
+    requested_set = set(requested)
+    return [tier for tier in ALL_TRACKER_TIERS if tier in requested_set]
 
 API_SOURCE_CONFIGS = {
     "hhwx": {
         "label": "HHWX Tracker Proxy",
-        "event_index_url": "https://hhwx.org/api/bandori/events",
-        "event_meta_url": None,
+        "event_index_url": "https://hhwx.org/api/bandori/master/events",
+        "event_meta_url": "https://hhwx.org/api/bandori/master/events/{event_id}",
         "tracker_url": "https://hhwx.org/api/bandori/tracker/data?server={server}&event={event_id}&type=event&tier={tier}",
         "top10_url": "https://hhwx.org/api/bandori/tracker/data?server={server}&event={event_id}&type=event&tier=10",
     },
