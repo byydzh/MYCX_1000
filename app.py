@@ -784,16 +784,20 @@ if should_run:
                                     'label': f'T{tier} 当前榜线',
                                     **tracker_provenance,
                                 })
-                            fallback_history_count = sum(
-                                bool(pack.get('fallback_used')) for pack in sp
-                            )
-                            if fallback_history_count:
+                            history_sources = {}
+                            for pack in sp:
+                                tracker_source = str(pack.get('source') or '').lower()
+                                if tracker_source:
+                                    history_sources.setdefault(tracker_source, False)
+                                if pack.get('fallback_used'):
+                                    history_sources[str(tds.fallback_api_source).lower()] = True
+
+                            for actual_source, used_fallback in sorted(history_sources.items()):
                                 notices.append({
-                                    'label': f'T{tier} 历史参考({fallback_history_count}个)',
+                                    'label': f'T{tier} 历史参考',
                                     'requested_source': source_key,
-                                    'source': 'bestdori',
-                                    'fallback_used': True,
-                                    'primary_error': 'HHWX 历史数据不完整',
+                                    'source': actual_source,
+                                    'fallback_used': used_fallback,
                                 })
                             return tier, tp, sp, None, notices
                         except Exception as exc:
@@ -935,21 +939,18 @@ if st.session_state.get('last_run_error'):
     st.error(f"上次运行失败：{st.session_state['last_run_error']}")
 
 source_status = st.session_state.get('data_source_status', [])
-fallback_status = [item for item in source_status if item.get('fallback_used')]
-if fallback_status:
-    details = []
-    for item in fallback_status:
-        detail = f"{item.get('label')}: {str(item.get('source')).upper()}"
-        if item.get('primary_error'):
-            detail += f"（主源失败：{item.get('primary_error')}）"
-        details.append(detail)
-    st.warning("数据源已降级到 Bestdori：" + "；".join(details))
-elif source_status:
-    source_summary = "；".join(
-        f"{item.get('label')}: {str(item.get('source')).upper()}"
-        for item in source_status
-    )
-    st.caption("本轮实际数据源：" + source_summary)
+if source_status:
+    actual_sources = []
+    for item in source_status:
+        actual_source = str(item.get('source') or '').strip().upper()
+        if actual_source and actual_source not in actual_sources:
+            actual_sources.append(actual_source)
+
+    if actual_sources:
+        source_summary = " / ".join(actual_sources)
+        if any(item.get('fallback_used') for item in source_status):
+            source_summary += "（自动切换）"
+        st.caption("本轮数据来源：" + source_summary)
 
 col_img, col_info = st.columns([3, 1])
 
