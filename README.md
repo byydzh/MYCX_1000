@@ -11,9 +11,6 @@ BangDream 国服活动档线实时预测系统。项目当前唯一的线上正�
 - 正式模型：`skeleton_kf`
 - 网页默认参数：`learned_notebook`
 
-`behavior_pace_model` 是离线研究用的奖励线实验模型。目前它没有通过替换线上
-基线的门槛，不参与网页正式预测。
-
 ## 项目要解决的问题
 
 活动档线不是匀速增长：开局热度、昼夜作息、活动类型、活动长度和终局追分都会
@@ -161,27 +158,14 @@ Skeleton+KF。当前线上基线不会用 T1000 冒充其他档，也不会在�
 
 ### Streamlit 网页
 
-网页选择 HHWX 时，活动索引、当前活动、活动详情、目标档 Tracker、历史 Tracker
-和 T10 scale 都按组件执行：
-
-```text
-HHWX -> Bestdori
-```
-
-HHWX 的 HTTP、JSON、结构或有效数据失败后，才读取 Bestdori；两者都不能提供该
-组件时才报错。一次预测可以由不同来源共同提供不同组件，页面只中性显示本轮实际
-来源；成功切换来源不是模型质量警告。
-
-直接选择 Bestdori 时不会反向请求 HHWX。成功的活动索引和实时 T10 scale 使用
-60 秒进程内缓存，失败结果不缓存。生产路径不启用档位插值，也不会在模型失败后
-改用另一种预测模型。
+网页默认使用 HHWX；HHWX 无法提供所需数据时会转向 Bestdori，并显示本轮实际
+来源。直接选择 Bestdori 时只读取 Bestdori。两套来源都没有有效输入时，本轮
+预测停止。
 
 ### CLI
 
-`main_pipeline.py` 当前是所选 provider 的严格模式，没有启用网页端的
-HHWX→Bestdori 自动路由。它也直接使用 `DEFAULT_CONFIG`，不会自动加载网页默认的
-`learned_notebook` preset；初始化节律处理器时目前也没有传入
-`panic_ease_power`。两种入口适合不同用途，不应把结果视为完全同构。
+`main_pipeline.py` 通过 `--api-source` 明确选择 HHWX 或 Bestdori，适合脚本化
+运行和批量调试。
 
 ## 运行项目
 
@@ -234,14 +218,8 @@ tracker.time <= cutoff
 还可以添加未来人工点，生成 what-if 虚拟路径。人工点只属于明确的干预模拟，不会
 混入普通预测。
 
-当前网页先按官方开始时间计算 T10 cutoff，随后目标档时间轴可能经过维护起点修正；
-存在维护延迟时，两者的绝对截止时刻可能不完全相同。因此网页 Debug 适合交互诊断，
-不作为严格 benchmark。公共 Tracker archive 也没有逐行 `available_at`，这里的
-遮罩只表达 API 时间戳，不是第三方保存的“当时首次公开时间”。
-
-CLI 的 `--debug_hours` 还会在遮罩目标档以前预取整场 T10 scale，同样不应用于
-严格因果比较。后述统一评估脚本会先确定一个绝对 origin，再对所有目标输入执行
-同一 `tracker.time <= origin` 规则。
+Debug 用于观察模型在不同活动阶段的响应。正式历史评估应对目标档、T10 和其他
+实时输入使用一致的冻结时刻，并确保历史样本早于目标活动。
 
 ## 配置与 preset
 
@@ -252,11 +230,6 @@ CLI 的 `--debug_hours` 还会在遮罩目标档以前预取整场 T10 scale，�
 |---|---|
 | `learned_notebook.json` | Streamlit 默认；由 `tuner/train.py` 生成的学习参数 |
 | `default.json` | 早期人工稳定参数，也是 `DEFAULT_CONFIG` 的兼容基线 |
-
-`learned_notebook` 自带的训练元数据显示 73 个训练活动、25 个测试活动和 5 个
-external holdout 活动；其 external-holdout relative MSE 为 `0.059616`，相对
-当时人工配置改善 `1.37%`。这是 preset 文件保存的训练记录，不等同于 MAPE，也
-不替代后续历史回放。
 
 真正参与引擎计算的主要参数组：
 
@@ -270,9 +243,6 @@ external holdout 活动；其 external-holdout relative MSE 为 `0.059616`，相
 | 在线 refit | `refit_*` | 控制当前数据的拟合窗口、正则、边界和融合权重 |
 | Kalman | `kf_*` | 控制 scale/trend 状态、过程噪声、测量噪声与截断 |
 | 速度压缩 | `smooth_thresh1`, `smooth_thresh2`, `smooth_hard_cap` | 限制目标档速度相对 T10 的比例 |
-
-`scale_min/max` 与 `corr_min/max` 仍存在于旧配置和网页控件中，但当前
-`PredictionEngine` 没有消费它们；不要把这四个字段当成已生效的预测约束。
 
 ## 训练与评估
 
@@ -291,43 +261,9 @@ python -m tuner.train --tier 1000 --history-count 80 --use-formal-holdout-split 
 python -m tuner.global_benchmark --prepare-cache --model-id skeleton_kf --preset-id learned_notebook
 ```
 
-训练产物不会自动成为网页默认 preset；需要显式审阅、命名并更新入口选择。
-
-### 完成活动的严格 rolling-origin 回放
-
-统一评估器从每个活动声明的真实奖励档生成 origin，用 `tracker.time <= origin`
-遮罩目标输入，并要求历史活动在目标活动开始前结束。评估缓存不会随 Git 仓库分发；
-首次运行前需要用 `collect_tier_surface_cache.py` 采集目标事件范围：
-
-```powershell
-python scripts/collect_tier_surface_cache.py --api-source hhwx --min-event-id 284 --max-event-id 319
-python scripts/evaluate_reward_tiers_318_319.py --event-id-range 284 319
-```
-
-尽管评估脚本文件名保留了最初的 `318_319`，当前 CLI 支持显式事件列表与闭区间
-范围。评估会并列输出线上同档 Skeleton、奖励行为换算 Skeleton、实验 pace、
-最后两点斜率、累计均速与 persistence；聚合顺序是 origin 等权、活动内奖励档
-等权、活动等权。
-
-“奖励行为换算 Skeleton”只是一种评估历史选择变体：它按奖励类别把目标奖励线
-映射到历史活动自己的精确奖励档。网页生产路径仍是同档历史 Skeleton。
-
-在 284–319 的固定回放中，线上同档 Skeleton 在其 418 个成功 origin 上 MAPE
-为 `15.99%`；同一支持集的实验 pace 为 `21.15%`。完整 466 个共同输入上，pace
-为 `21.64%`，最后两点斜率为 `25.09%`，累计均速为 `28.84%`。因此正式模型继续
-使用 Skeleton+KF；这些历史回放可以立即重复，不需要等待未来活动才能评价模型。
-
-## 行为 pace 实验
-
-[`behavior_pace_model.py`](behavior_pace_model.py) 研究另一条路线：直接以活动
-master 数据中的真实奖励线为目标，用 `sustain / launch / deadline` 三个非负
-分量描述共享活动节奏，再为每个档位拟合独立幅度。它支持异步 Tracker 时间点，
-不把 T1000 固定为目标或尺度。
-
-训练先验由 [`behavior_pace_prior.py`](behavior_pace_prior.py) 在事件 `192..283`
-的固定六档支持上按事件等权构建；实现方程、识别假设和数据契约见
-[`BEHAVIOR_MODEL_THEORY.md`](BEHAVIOR_MODEL_THEORY.md)。该模型当前只用于离线
-实验，不在 `configs/models.json` 注册，也不替代线上结果。
+`tuner/offline_evaluator.py` 提供历史快照评估，`tuner/global_benchmark.py`
+用于在同一数据集上比较 preset。训练产物不会自动成为网页默认配置，需要显式
+审阅并加入 `configs/models/skeleton_kf/`。
 
 ## 代码结构
 
@@ -345,11 +281,7 @@ master 数据中的真实奖励线为目标，用 `sustain / launch / deadline` 
 | [`configs/models/skeleton_kf`](configs/models/skeleton_kf) | 正式模型参数文件 |
 | [`base_speed_distribution.json`](base_speed_distribution.json) | 工作日/周末 24 小时速度分布 |
 | [`tuner`](tuner) | Skeleton 参数训练、离线评估与 benchmark |
-| [`tier_surface.py`](tier_surface.py) | 固定档位 as-of 快照与质量检查工具 |
-| [`scripts/collect_tier_surface_cache.py`](scripts/collect_tier_surface_cache.py) | 多档 Tracker 与奖励元数据缓存采集 |
-| [`scripts/evaluate_reward_tiers_318_319.py`](scripts/evaluate_reward_tiers_318_319.py) | 多模型 rolling-origin 统一评估 |
-| [`behavior_pace_model.py`](behavior_pace_model.py) | 实验 pace 点预测模型 |
-| [`tests`](tests) | 数据源、基线、配置、回放与实验模型的聚焦测试 |
+| [`tests`](tests) | 数据源、Skeleton 数学、配置与离线评估测试 |
 
 主调用关系：
 
@@ -377,21 +309,13 @@ Skeleton 数学、配置与离线评估：
 python -m pytest tests/test_duration_alignment.py tests/test_refit_guardrails.py tests/test_config_loading.py tests/test_backward_compat.py tests/test_offline_evaluator.py tests/test_global_benchmark.py
 ```
 
-实验 pace 与统一评估器：
-
-```powershell
-python -m pytest tests/test_behavior_pace_model.py tests/test_behavior_pace_prior.py tests/test_collect_tier_surface_cache.py tests/test_reward_tier_evaluator.py
-```
-
 ## 已知限制
 
 - 公共 API 只提供固定档位，不支持任意连续排名；网页目前只暴露四条常用档线。
 - Skeleton 必须有有效 T10 scale 和至少一个可拟合同档历史；缺失时明确失败。
-- 各档独立建模，当前线上基线不表达跨档竞争或活动奖励之间的联动。
+- 各档独立建模，当前线上基线不做多档联合状态估计。
 - 模型没有概率预测区间；输出是点预测与确定性曲线。
 - 昼夜分布、终局函数、维护起点修正和 T10 硬顶仍是结构性假设。
-- 公共 archive 没有逐行 `available_at`，历史 Debug 只保证 Tracker 时间戳遮罩。
-- 网页与 CLI 在 preset、provider 路由和 `panic_ease_power` 传递上尚未完全同构。
 - 在线数据只有短期进程缓存；若没有冻结原始 API 响应，历史数值不保证逐字节复现。
 
 仓库当前未声明开源许可证。
