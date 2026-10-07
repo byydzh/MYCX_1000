@@ -83,3 +83,31 @@ def test_aggregation_weights_events_then_tiers_and_keeps_paired_support():
     rows += [dict(event_id=2,tier=500,actual=100,predictions={"a":150,"b":100})]
     assert aggregate(rows,"a")["mape"] == pytest.approx(35)
     assert aggregate(rows,"a",support="b")["mape"] == pytest.approx(30)
+
+
+def test_template_cache_refits_when_pace_model_changes(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from scripts import experiment_behavior_cohorts as experiment
+
+    for name in ("behavior_cohort_model.py", "behavior_pace_model.py",
+                 "behavior_pace_prior.py", "scripts/experiment_behavior_cohorts.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original source", encoding="utf-8")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "192.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(experiment, "ROOT", tmp_path)
+    monkeypatch.setattr(experiment, "CACHE", cache)
+    monkeypatch.setattr(experiment, "OUT", tmp_path / "output")
+    template = CohortTemplate(192, START-H, "challenge", 500, (1,0,0,0,0,0), 0)
+    fitter = Mock(return_value=([template], [], []))
+    monkeypatch.setattr(experiment, "build_templates", fitter)
+
+    experiment.get_templates(192, "cohort6")
+    experiment.get_templates(192, "cohort6")
+    assert fitter.call_count == 1
+
+    (tmp_path / "behavior_pace_model.py").write_text("changed integrator", encoding="utf-8")
+    experiment.get_templates(192, "cohort6")
+    assert fitter.call_count == 2

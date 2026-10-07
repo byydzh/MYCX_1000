@@ -78,8 +78,8 @@ def build_templates(event_ids, basis):
 def get_templates(train_max, basis):
     """One bounded fit cache per basis, bound to exact sources and input bytes."""
     path = OUT / f"fits_{basis}.json"
-    source = {n:sha(ROOT/n) for n in ("behavior_cohort_model.py", "behavior_pace_prior.py",
-                                      "scripts/experiment_behavior_cohorts.py")}
+    source = {n:sha(ROOT/n) for n in ("behavior_cohort_model.py", "behavior_pace_model.py",
+                                      "behavior_pace_prior.py", "scripts/experiment_behavior_cohorts.py")}
     inputs = [{"event_id":e, "sha256":sha(CACHE/f"{e}.json")} for e in range(192,train_max+1)]
     if path.exists():
         prior = json.loads(path.read_text(encoding="utf-8"))
