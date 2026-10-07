@@ -79,5 +79,3 @@ Debug 模式可指定历史活动、冻结时间和未来假设点。回放的�
 行为模型仍处于实验阶段，未接入网页；数学定义见
 [Pace v1](BEHAVIOR_MODEL_THEORY.md)，后续方案见
 [Cohort 实验](EXPERIMENT_20260908.md)及[结果报告](event_data/cohort_experiment_20260908/report.md)。
-
-仓库当前未声明开源许可证。
