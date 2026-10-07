@@ -1,4 +1,4 @@
-# Ignore everything except Python source files and this .gitignore
+# Track source, documentation, configs and selected research artifacts explicitly.
 *
 
 # Keep this file
@@ -17,6 +17,9 @@
 !config_learning.py
 !base_speed_distribution.json
 !README.md
+!AGENTS.md
+!docs/
+!docs/*.md
 !requirements.txt
 !example
 !example/*
