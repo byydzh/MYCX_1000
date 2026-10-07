@@ -9,7 +9,9 @@
 !base_distribution.py
 !behavior_pace_model.py
 !behavior_pace_prior.py
+!behavior_cohort_model.py
 !BEHAVIOR_MODEL_THEORY.md
+!EXPERIMENT_20260908.md
 !app.py
 !config.py
 !config_learning.py
@@ -37,6 +39,8 @@
 !scripts
 !scripts/collect_tier_surface_cache.py
 !scripts/evaluate_reward_tiers_318_319.py
+!scripts/experiment_behavior_cohorts.py
+!scripts/report_behavior_cohorts.py
 
 # Pace-model frozen prior only; legacy behavior protocols stay ignored.
 !configs/
@@ -51,3 +55,13 @@ configs/behavior_model/*
 !event_data
 !event_data/tier_speed_profiles_last100.json
 !event_data/song_rank_shape_event311.json
+!event_data/cohort_experiment_20260908/
+event_data/cohort_experiment_20260908/*
+!event_data/cohort_experiment_20260908/selection.json
+!event_data/cohort_experiment_20260908/prior.json
+!event_data/cohort_experiment_20260908/screen.json
+!event_data/cohort_experiment_20260908/repair.json
+!event_data/cohort_experiment_20260908/confirm.json
+!event_data/cohort_experiment_20260908/replay.json
+!event_data/cohort_experiment_20260908/report.md
+!event_data/cohort_experiment_20260908/comparison.png

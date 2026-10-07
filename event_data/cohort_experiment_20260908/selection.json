@@ -1,0 +1,26 @@
+{
+  "name": "cohort6_all_k64_reward",
+  "config": {
+    "basis": "cohort6",
+    "same_type": false,
+    "strength": 64,
+    "rank_bandwidth": 0.6931471805599453,
+    "reward_transfer": true
+  },
+  "selected_on": "240..263 reward-tier event-equal MAPE; one mechanism repair",
+  "training": "192..239",
+  "selection_mape": 13.03684613830068,
+  "unrepaired_selection": {
+    "name": "cohort6_all_k64",
+    "config": {
+      "basis": "cohort6",
+      "same_type": false,
+      "strength": 64,
+      "rank_bandwidth": 0.6931471805599453,
+      "reward_transfer": false
+    },
+    "selected_on": "240..263 reward-tier event-equal MAPE",
+    "training": "192..239",
+    "selection_mape": 17.956672119597055
+  }
+}
