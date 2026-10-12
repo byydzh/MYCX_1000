@@ -35,7 +35,6 @@ python main_pipeline.py --api-source hhwx --tiers "500,1000,1500,2000"
 | `--debug_hours`, `-d` | 只保留目标档前若干小时的数据，用于调试 |
 
 CLI 计算全部请求档位，绘图仅显示第一个成功档位。
-`--debug_hours` 尚未同步截断 T10 输入，不能直接用作严格历史回测。
 
 ## 数据与配置
 
@@ -51,7 +50,7 @@ CLI 计算全部请求档位，绘图仅显示第一个成功档位。
 预设文件位于 `configs/models/skeleton_kf/`，模型注册表位于
 [`configs/models.json`](configs/models.json)。
 
-Debug 模式可指定历史活动、冻结时间和未来假设点。回放的时间口径与注意事项见
+Debug 模式可指定历史活动、冻结时间和未来假设点。回放操作与数据口径见
 [开发说明](docs/development.md#历史回放)。
 
 ## 预测边界
